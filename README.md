@@ -297,3 +297,87 @@ El JSON lleva `fecha_corte`, `huella_datos`, los cuatro parámetros del modelo y
 `lineas` con `proveedor_id`, `sku_id` y `cantidad_cajas` confirmadas.
 Devuelve el archivo con hojas Orden_Compra, Auditoria y Parametros.
 No persiste ajustes, no emite compras ni cambia los Excel originales.
+
+## Paso 4: tablero ejecutivo de capital y riesgo
+
+El tablero está en `/dashboard`, accesible desde la navegación de la app. Sus
+cálculos puros viven en [`dashboard.py`](dashboard.py) y los componentes en
+[`frontend/components/executive-dashboard.tsx`](frontend/components/executive-dashboard.tsx),
+`catalog-health.tsx` y `abc-matrix.tsx`. Comparte navegación y tema con la mesa OCS.
+
+Con FastAPI iniciado, consulta los datos locales:
+
+```bash
+curl -sS 'http://127.0.0.1:8000/api/v1/dashboard/metrics?ventana_dias=60'
+```
+
+Se lee el catálogo e inventario y **también ventas históricas**, necesarias para
+medir cobertura y demanda en riesgo. Se reutiliza el ETL y el pronóstico del
+Paso 2. No se utilizan cifras inventadas si falta el histórico.
+`ventana_dias` admite 30 a 60 días y vale 60 por defecto.
+
+El `GET` lee los tres libros de `DATA_DIR`. Existe además `POST` en la misma
+ruta con los tres uploads opcionales para la carga desde la interfaz. Los
+archivos cargados en otra página no se conservan: cada pantalla debe cargarlos
+o utilizar los archivos locales del servicio.
+
+### Definiciones de los indicadores
+
+| Indicador | Cálculo |
+| --- | --- |
+| `capital_sobreinventario_usd` | Por SKU: `max(0, stock_utilizable - 90 × demanda_diaria_ponderada) × costo_unitario_actual`. Se valora solo el excedente, no todo el stock del SKU. |
+| `venta_riesgo_quiebre_usd` | Solo Clase A del catálogo: demanda física no cubierta en los próximos 14 días, simulando FEFO y llegadas de tránsito, multiplicada por la proporción estimada de unidades pagadas y el precio de lista. Los bonos consumen stock, pero no crean ingreso. |
+| `inventario_riesgo_vencimiento_usd` | Stock disponible de cada lote con vencimiento a **menos de 120 días** del corte, a costo actual. Incluye vencidos; `inventario_vencido_usd` los identifica como subconjunto. Un lote exactamente a 120 días no se incluye. |
+
+Por ejemplo, con demanda de 10 unidades/día, 1.000 unidades utilizables y costo
+USD 1, el capital excedente es USD 100 (1.000 − 900), no USD 1.000.
+Con 10 unidades de stock, sin tránsito, demanda pagada de 10/día y precio USD 2,
+una Clase A tiene USD 260 de venta estimada sin cobertura en 14 días.
+
+El corte del inventario se interpreta como inicio del día, igual que el OCS.
+Las ventas del corte o posteriores se excluyen. Los bonos forman parte de la
+demanda física; las NC no representan demanda negativa en su fecha de emisión.
+La proporción pagada usa los mismos pesos diarios recientes del pronóstico.
+No se agregan impuestos ni flete a los precios informados.
+
+Los montos son **exposición estimada**, no pérdidas confirmadas. Los indicadores
+se pueden superponer y no deben sumarse como pérdida total. Los lotes ya vencidos
+no aportan cobertura ni capital excedente utilizable, pero sí exposición a vencimiento.
+Los SKU descontinuados se incluyen para no ocultar existencias inmovilizadas.
+
+### Salud y matriz ABC
+
+Los estados de salud son exclusivos y suman el total del catálogo:
+
+1. `quiebre`: stock utilizable cero **o** demanda sin cobertura proyectada a 14 días.
+2. `exceso`: más de 90 días de cobertura, si no está en el estado anterior.
+3. `optimo`: inventario e historial conocidos, 14 días cubiertos y sin exceso.
+4. `sin_datos`: inventario o historial insuficiente para clasificar; no se fuerza a óptimo.
+
+Un SKU sin facturas históricas no se equipara a demanda cero. Si tiene historia
+pero ninguna venta en la ventana reciente, el stock positivo se considera sin
+rotación y excedente; se informa esa condición y no se serializa cobertura infinita.
+Sin histórico/inventario se excluye el monto que no puede estimarse y se devuelven
+conteos en `cobertura_calculo`; el tablero indica estimaciones parciales.
+
+La **matriz 3×3 confirmada** cruza el ABC de volumen del catálogo con ABC de aporte
+al margen bruto estimado en la ventana reciente. Fórmula del aporte:
+
+```text
+venta_neta_normalizada − costo_actual × (unidades_vendidas_netas + bonos_netos)
+```
+
+Las NC se normalizan con `-abs` sin invertir las ya negativas. El margen se estima
+a costo actual: no reproduce costos contables históricos, descuentos no registrados
+ni la recuperación física de devoluciones dañadas.
+
+Los aportes positivos se ordenan de mayor a menor, usando SKU como desempate.
+La clase se decide por participación acumulada **anterior** al SKU: A antes de
+80%, B antes de 95%, C el resto. Así el SKU que cruza el umbral permanece en su
+clase y el principal contribuyente siempre es A. Aportes conocidos cero/negativos
+son C. Los desconocidos se cuentan aparte en `skus_sin_clase_margen`.
+Las nueve celdas más los desconocidos suman todos los SKU.
+
+El JSON también devuelve `detalle_skus`, `criterios`, `salud_catalogo`,
+`matriz_abc`, `parametros` y avisos del ETL. La interfaz permite abrir cada KPI,
+estado de salud o celda ABC para revisar los SKU que lo explican.

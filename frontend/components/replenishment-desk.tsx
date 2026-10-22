@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, Boxes, CalendarDays, Check, CheckCircle2,
-  ChevronDown, CircleHelp, ClipboardList, FileSpreadsheet, Filter, Layers3, Loader2,
-  Moon, Package, RefreshCw, RotateCcw, Search, ShieldCheck, SlidersHorizontal,
-  Sun, TriangleAlert, Upload, X,
+  ChevronDown, FileSpreadsheet, Filter, Loader2,
+  Package, RefreshCw, RotateCcw, Search, ShieldCheck, SlidersHorizontal,
+  TriangleAlert, Upload, X,
 } from "lucide-react";
 import { downloadOrder, fetchSuggestions } from "@/lib/api";
 import { boxText, canBuy, dateLabel, filterRows, isAdjusted, isCritical, number, quantity, rowKey, selectedOrder, usd } from "@/lib/ocs";
@@ -13,6 +13,7 @@ import type { Edits, OCSResponse, OCSRow, Sources, View } from "@/lib/types";
 import { Dialog } from "./dialog";
 import { OrderTable } from "./order-table";
 import { SourceUpload } from "./source-upload";
+import { WorkspaceShell } from "./workspace-shell";
 
 const PAGE_SIZE = 10;
 const emptyFilters = { supplier: "", category: "", brand: "", search: "", view: "todos" as View };
@@ -33,7 +34,6 @@ export function ReplenishmentDesk() {
   const [sort, setSort] = useState<"priority" | "sku-asc" | "sku-desc">("priority");
   const [modal, setModal] = useState<"sources" | "warnings" | "help" | null>(null);
   const [warningSku, setWarningSku] = useState<string | null>(null);
-  const [dark, setDark] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const rows = useMemo(() => data?.orden_sugerida ?? [], [data]);
   const warnings = useMemo(() => data?.advertencias ?? [], [data]);
@@ -56,8 +56,6 @@ export function ReplenishmentDesk() {
   }, []);
 
   useEffect(() => { void calculate({}, 60); return () => controller.current?.abort(); }, [calculate]);
-  useEffect(() => { setDark(localStorage.getItem("abasto-theme") === "dark"); }, []);
-  useEffect(() => { document.documentElement.classList.toggle("dark", dark); }, [dark]);
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if (event.key === "/" && !(event.target instanceof HTMLElement && event.target.closest("input,textarea,select,[contenteditable]"))) {
@@ -122,17 +120,7 @@ export function ReplenishmentDesk() {
   const modalWarnings = warningSku ? warnings.filter(warning => warning.sku_id === warningSku) : warnings;
   const selectedSku = rows.find(row => row.sku_id === warningSku);
 
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <a className="brand" href="/replenishment" aria-label="Abasto, mesa de compras"><div className="brand-symbol"><Layers3 size={23} strokeWidth={1.7} /></div><span>abasto<span className="brand-period">.</span></span></a>
-      <div className="workspace-label"><span className="workspace-avatar">D</span><div><strong>Distribuidora</strong><span>El Salvador · B2B</span></div></div>
-      <p className="nav-section">PLANIFICACIÓN</p>
-      <nav><a href="/replenishment" className="nav-item active" aria-current="page"><ClipboardList size={18} /><span>Mesa de compras</span><span className="nav-indicator" /></a><button className="nav-item" onClick={() => setModal("help")}><CircleHelp size={18} /><span>Guía de trabajo</span></button></nav>
-      <div className="sidebar-bottom"><div className="sidebar-note"><ShieldCheck size={19} /><p>Decisiones informadas.<br /><strong>Compras bajo tu control.</strong></p></div><div className="sidebar-person"><span className="person-avatar">CP</span><div><strong>Equipo de compras</strong><span>Mesa operativa</span></div></div></div>
-    </aside>
-
-    <div className="main-shell">
-      <header className="topbar"><div className="breadcrumb"><span>Operaciones</span><span className="breadcrumb-slash">/</span><strong>Reabastecimiento</strong></div><div className="topbar-actions"><span className="market-label">El Salvador <span>USD</span></span><span className="vertical-divider" /><button className="icon-button" aria-label={dark ? "Activar modo claro" : "Activar modo oscuro"} onClick={() => { const next = !dark; setDark(next); localStorage.setItem("abasto-theme", next ? "dark" : "light"); }}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon-button" onClick={() => setModal("help")} aria-label="Ayuda de la mesa de trabajo"><CircleHelp size={18} /></button><span className="top-avatar">CP</span></div></header>
+  return <WorkspaceShell section="replenishment" onHelp={() => setModal("help")}>
       <main>
         <div className="page-heading"><div><div className="page-eyebrow"><span className="eyebrow-line" /> REABASTECIMIENTO INTELIGENTE</div><h1>Mesa de trabajo <span>OCS</span></h1><p>De la demanda a la compra. Revisa, ajusta y confirma tu próximo pedido.</p></div><div className="heading-actions"><button className="button-secondary" disabled={disabled} onClick={() => setModal("sources")}><Upload size={16} /> Cargar archivos</button><button className="button-primary" onClick={exportOrder} disabled={!canExport}>{exporting ? <Loader2 size={16} className="animate-spin" /> : <ArrowDownToLine size={16} />} Descargar Orden de Compra (.xlsx)</button></div></div>
 
@@ -167,12 +155,11 @@ export function ReplenishmentDesk() {
         <p className="page-footnote">ABASTO · PLANIFICACIÓN DE COMPRAS <span>XLSX estándar · Importes en USD</span></p>
         <span className="sr-only" aria-live="polite">{loading ? "Calculando sugerencias" : data ? `${rows.length} productos cargados. ${order.lines.length} líneas seleccionadas.` : "Sin datos cargados"}</span>
       </main>
-    </div>
 
     {modal === "sources" && <Dialog title="Actualizar fuentes de datos" onClose={() => setModal(null)}><SourceUpload current={sources} onCalculate={files => recalculate(files)} /></Dialog>}
     {modal === "help" && <Dialog title="De la sugerencia a tu orden" onClose={() => setModal(null)}><div className="help-steps"><HelpStep number="01" title="Valida tus datos">Carga tus tres Excel o utiliza los archivos locales del servicio. El corte del inventario determina la fecha del cálculo.</HelpStep><HelpStep number="02" title="Revisa la cobertura">El pronóstico usa ventas facturadas y bonos. El ROP suma demanda durante el plazo y stock de seguridad al 95% de servicio.</HelpStep><HelpStep number="03" title="Confirma cantidades">Edita cajas completas o ingresa cero para omitir. El MOQ sigue vigente; los SKU descontinuados o sin datos suficientes requieren revisión y no se exportan.</HelpStep><HelpStep number="04" title="Descarga tu selección">Selecciona las líneas que deseas comprar. El XLSX estándar contiene Orden_Compra, Auditoria y Parametros. No es una integración certificada con un ERP.</HelpStep></div><div className="source-note"><ShieldCheck size={18} /><p>Los cambios de cantidad son temporales y se descartan al recargar la página o recalcular. Descarga tu orden para conservarlos.</p></div></Dialog>}
     {modal === "warnings" && <Dialog title={warningSku ? `Detalle de ${warningSku}` : "Centro de alertas"} onClose={() => setModal(null)}><p className="dialog-description">{selectedSku ? selectedSku.nombre_producto : "Señales del cálculo y calidad de datos. Las alertas no se ocultan al filtrar la tabla."}</p><div className="warning-list">{modalWarnings.length ? modalWarnings.map((warning, index) => <article className={`warning-item ${warning.codigo.includes("QUIEBRE") ? "critical-warning" : ""}`} key={index}><TriangleAlert size={18} /><div><span className="warning-label">{warning.sku_id || warning.archivo || "Cálculo general"}</span><h3>{warning.codigo.toLowerCase().replaceAll("_", " ")}</h3><p>{warning.mensaje}{warning.cantidad ? ` (${warning.cantidad} registros)` : ""}</p></div></article>) : <p className="dialog-description">No hay avisos específicos para este SKU.</p>}</div>{selectedSku && <div className="fefo-section"><h3>Prioridad de rotación FEFO</h3>{selectedSku.prioridad_fefo.map((lot, index) => <div className="fefo-lot" key={`${lot.bodega_id}-${lot.lote}`}><span>{index + 1}</span><div><strong>{lot.lote}</strong><p>{lot.bodega_id} · Vence {dateLabel(lot.fecha_vencimiento)}</p></div><b className={lot.vencido_al_corte ? "text-danger" : ""}>{lot.vencido_al_corte ? "Vencido" : `${number(lot.stock_disponible)} uds.`}</b></div>)}</div>}</Dialog>}
-  </div>;
+  </WorkspaceShell>;
 }
 
 function Metric({ label, value, foot, icon, accent, danger }: { label: string; value: string; foot: string; icon: React.ReactNode; accent?: boolean; danger?: boolean }) {

@@ -10,7 +10,7 @@ const labels: { name: SourceName; label: string; description: string }[] = [
   { name: "inventario_actual", label: "Inventario actual", description: "Existencias por lote y stock en tránsito" },
 ];
 
-export function SourceUpload({ current, onCalculate }: { current: Sources; onCalculate: (files: Sources) => void }) {
+export function SourceUpload({ current, onCalculate, actionLabel = "Calcular sugerencias" }: { current: Sources; onCalculate: (files: Sources) => void; actionLabel?: string }) {
   const [files, setFiles] = useState<Sources>(current);
   const [error, setError] = useState("");
   function select(name: SourceName, file?: File) {
@@ -27,6 +27,6 @@ export function SourceUpload({ current, onCalculate }: { current: Sources; onCal
     </div>)}</div>
     {error && <p className="field-error" role="alert">{error}</p>}
     <div className="source-note"><UploadCloud size={17} /><p>Los archivos se procesan en memoria. No se guardan en el navegador ni se agregan a GitHub.</p></div>
-    <button type="submit" className="button-primary w-full justify-center" disabled={!!error}>Calcular sugerencias <ArrowRight size={17} /></button>
+    <button type="submit" className="button-primary w-full justify-center" disabled={!!error}>{actionLabel} <ArrowRight size={17} /></button>
   </form>;
 }

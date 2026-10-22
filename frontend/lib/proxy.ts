@@ -5,8 +5,8 @@ export async function forward(request: Request, path: string) {
     const destination = new URL(path, base.endsWith("/") ? base : `${base}/`);
     if (!["http:", "https:"].includes(destination.protocol)) throw new Error("Invalid protocol");
     const response = await fetch(destination, {
-      method: "POST",
-      body: await request.formData(),
+      method: request.method === "GET" ? "GET" : "POST",
+      ...(request.method === "GET" ? {} : { body: await request.formData() }),
       cache: "no-store",
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]),
     });

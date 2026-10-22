@@ -152,3 +152,53 @@ usar un Chromium instalado; `FRONTEND_URL` cambia la dirección de la app y
 filtros, ajustes, descarga con cantidades confirmadas, carga real de los tres
 Excel, temas, diseño móvil y errores de conexión. Sus archivos quedan en la
 carpeta temporal del sistema, sin modificar las fuentes.
+
+## Tablero ejecutivo (`/dashboard`)
+
+La navegación lateral, y las pestañas en móvil, conectan la mesa OCS con el nuevo
+tablero. No hacen falta dependencias nuevas ni otra configuración de conexión.
+Actualiza también FastAPI al Paso 4 antes de iniciar la interfaz.
+
+| Archivo | Responsabilidad |
+| --- | --- |
+| `components/workspace-shell.tsx` | Navegación y tema comunes para ambas páginas |
+| `components/executive-dashboard.tsx` | KPI, filtros, actualización, carga y detalle |
+| `components/catalog-health.tsx` | Anillo y leyenda interactiva de salud |
+| `components/abc-matrix.tsx` | Matriz 3×3 de volumen y margen |
+| `lib/dashboard.ts` | Contratos, filtros y proporciones |
+| `app/api/dashboard/route.ts` | Proxy GET/POST a `/api/v1/dashboard/metrics` |
+
+Los tres KPI muestran capital excedente a más de 90 días, venta Clase A en riesgo
+a 14 días y stock en lotes con menos de 120 días remanentes. Consulta las fórmulas
+en **Ver criterios**: los montos de inventario están a costo; los de venta, a lista.
+No se presentan como pérdidas confirmadas ni se suman entre sí.
+
+- Al abrir la página se consulta el `GET` de archivos locales. **Cargar archivos**
+  usa la variante multipart sin persistir libros ni compartir archivos entre clientes.
+- Pulsa un KPI para ver sus contribuyentes, una señal de salud para filtrar por
+  estado o una celda ABC para cruzar volumen y margen.
+- **Ver catálogo completo** limpia los filtros y muestra también los SKU con
+  exposición cero o datos insuficientes. `—` significa no estimable, no cero.
+- Un monto cero de vencimiento es válido: significa que no hay stock en lotes
+  dentro del umbral, no que el servicio falló.
+- Si falla una actualización, se conserva el cálculo previo con un aviso de
+  antigüedad. La ventana puede cambiar entre 30 y 60 días.
+
+La salud incluye quiebre actual **o proyectado en 14 días**; por eso no equivale
+al simple conteo de stock cero del ETL o al riesgo dentro del lead time variable
+del OCS. Los casos sin datos se separan para no mostrarlos como saludables.
+
+Con los nueve archivos de referencia y corte 21/10/2026, usando 60 días, se
+verificaron USD 8.840,14 de excedente, USD 291,65 de venta Clase A en riesgo y
+USD 0 de exposición a vencimiento. La salud suma 11 + 22 + 17 = 50 SKU.
+
+Para probar el tablero con navegador, ambos servidores iniciados y los archivos
+originales locales, ejecuta desde la raíz:
+
+```bash
+python frontend/tests/dashboard_browser_smoke.py
+```
+
+Reutiliza Playwright y las variables opcionales descritas en la prueba de la mesa.
+Comprueba KPI contra el GET real, filtros, carga multipart, navegación con OCS,
+temas, móvil y conservación del cálculo anterior si falla una actualización.

@@ -28,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 from engine import EngineInputError, ReplenishmentConfig, generate_suggested_order
 from exporter import PurchaseExport, workbook_bytes
+from dashboard import build_dashboard_metrics
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).resolve()
@@ -68,7 +69,7 @@ SCHEMAS = {
     },
 }
 
-app = FastAPI(title="Demanda y reabastecimiento B2B", version="0.3.0")
+app = FastAPI(title="Demanda y reabastecimiento B2B", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -79,7 +80,7 @@ app.add_middleware(
         if item.strip()
     ],
     allow_credentials=False,
-    allow_methods=["POST"],
+    allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
 
@@ -355,6 +356,22 @@ def source_fingerprint(contents):
     return digest.hexdigest()
 
 
+def dashboard_contents(contents, summary, errors, config, status_code=200):
+    tables, warnings, status_code = load_validated_tables(contents, summary, errors, status_code)
+    result = {"estado": "error", "errores": errors, "resumen": summary, "advertencias": warnings}
+    if errors:
+        return JSONResponse(status_code=error_status(status_code, 422), content=result, headers={"Cache-Control": "no-store"})
+    try:
+        metrics = build_dashboard_metrics(*(tables[key] for key in SCHEMAS), config=config)
+    except EngineInputError as exc:
+        issue(errors, "dashboard", exc.code, str(exc))
+        return JSONResponse(status_code=422, content=result, headers={"Cache-Control": "no-store"})
+    result.update(metrics)
+    result["estado"] = "exito"
+    result["advertencias"] = warnings + metrics["advertencias"]
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
 def export_contents(contents, summary, errors, order, status_code=200):
     def failure(code, message, status=422):
         issue(errors, "orden_compra", code, message)
@@ -447,6 +464,25 @@ async def collect_sources(ventas_historicas, catalogo_sku, inventario_actual):
             if upload is not None:
                 await upload.close()
     return contents, summary, errors, status_code
+
+
+@app.get("/api/v1/dashboard/metrics")
+async def dashboard_metrics(ventana_dias: int = Query(default=60, ge=30, le=60)):
+    """Indicadores al corte: lee catálogo, inventario y ventas de DATA_DIR."""
+    contents, summary, errors, status = await collect_sources(None, None, None)
+    return await run_in_threadpool(dashboard_contents, contents, summary, errors, ReplenishmentConfig(window_days=ventana_dias), status)
+
+
+@app.post("/api/v1/dashboard/metrics")
+async def dashboard_metrics_upload(
+    ventas_historicas: UploadFile | None = File(default=None),
+    catalogo_sku: UploadFile | None = File(default=None),
+    inventario_actual: UploadFile | None = File(default=None),
+    ventana_dias: int = Query(default=60, ge=30, le=60),
+):
+    """Variante multipart para tableros con archivos cargados sin persistencia."""
+    contents, summary, errors, status = await collect_sources(ventas_historicas, catalogo_sku, inventario_actual)
+    return await run_in_threadpool(dashboard_contents, contents, summary, errors, ReplenishmentConfig(window_days=ventana_dias), status)
 
 
 @app.post("/api/v1/ingest/validate")
