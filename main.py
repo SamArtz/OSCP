@@ -29,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 from engine import EngineInputError, ReplenishmentConfig, generate_suggested_order
 from exporter import PurchaseExport, workbook_bytes
 from dashboard import build_dashboard_metrics
+from integrity import join_catalog
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).resolve()
@@ -189,6 +190,10 @@ def validate_schema(df, name, errors):
         converted = pd.to_datetime(original.where(iso_or_date), format="mixed", errors="coerce", utc=True).dt.tz_convert(None)
         check(errors, name, "FECHA_INVALIDA", f"'{col}': use fecha Excel o ISO YYYY-MM-DD.", original.notna() & converted.isna())
         df[col] = converted
+    # La unicidad se comprueba al cargar el catálogo, antes de cualquier cruce.
+    # Ventas y lotes pueden repetir SKU legítimamente; no se deduplican.
+    if name == "catalogo_sku":
+        check(errors, name, "SKU_DUPLICADO", "sku_id debe ser único en el catálogo.", df.sku_id.duplicated(keep=False))
     check(errors, name, "FILAS_DUPLICADAS", "Hay filas idénticas; no se eliminan automáticamente.", df.duplicated(keep=False))
     return len(errors) == initial_errors
 
@@ -207,7 +212,6 @@ def validate_business(tables, errors, warnings):
     check(errors, sn, "PRECIO_NEGATIVO", "El precio unitario no puede ser negativo.", sales.precio_unitario_usd.lt(0))
     check(errors, sn, "MOTIVO_NC_FALTANTE", "Indique el motivo de la nota de crédito.", nc & sales.motivo_nc.str.casefold().isin(["ninguno", "no aplica", "n/a"]))
     check(warnings, sn, "LINEA_REPETIDA", "Documento/SKU repetido; confirme líneas distintas con un id de línea.", sales.duplicated(["id_documento", "sku_id"], keep=False))
-    check(errors, cn, "SKU_DUPLICADO", "sku_id debe ser único en el catálogo.", catalog.sku_id.duplicated(keep=False))
     check(errors, cn, "ESTADO_INVALIDO", "Estado esperado: ACTIVO, DESCONTINUADO o LANZAMIENTO.", ~catalog.estado.isin(["ACTIVO", "DESCONTINUADO", "LANZAMIENTO"]))
     check(errors, cn, "ABC_INVALIDO", "Clasificación esperada: A, B o C.", ~catalog.clasificacion_abc.isin(["A", "B", "C"]))
     for col in ["unidades_por_caja", "moq_cajas", "vida_util_dias"]:
@@ -238,8 +242,8 @@ def validate_business(tables, errors, warnings):
         issue(errors, inn, "CORTES_MEZCLADOS", "El inventario actual debe representar un único corte.")
     if errors:
         return
-    box = inventory.sku_id.map(catalog.set_index("sku_id").unidades_por_caja)
-    check(warnings, inn, "STOCK_NO_MULTIPLO_CAJA", "Disponible no múltiplo de caja según el diccionario; confirme fraccionamiento.", inventory.stock_disponible.mod(box).ne(0))
+    inventory_with_catalog = join_catalog(inventory[["sku_id", "stock_disponible"]], catalog, ["unidades_por_caja"])
+    check(warnings, inn, "STOCK_NO_MULTIPLO_CAJA", "Disponible no múltiplo de caja según el diccionario; confirme fraccionamiento.", inventory_with_catalog.stock_disponible.mod(inventory_with_catalog.unidades_por_caja).ne(0))
     check(warnings, cn, "SKU_SIN_INVENTARIO", "SKU del catálogo sin registro de inventario; no se asume stock cero.", ~catalog.sku_id.isin(inventory.sku_id))
     check(warnings, sn, "VENTA_POSTERIOR_CORTE", "Hay ventas posteriores al corte del inventario actual.", sales.fecha_factura.gt(inventory.fecha_corte.max()))
 

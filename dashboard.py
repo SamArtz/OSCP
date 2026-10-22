@@ -10,6 +10,8 @@ from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
 
 from engine import EngineInputError, ReplenishmentConfig, demand_profile, simulate_fefo
+from integrity import join_catalog, validate_sku_integrity
+from stock_policy import EXCESS_DAYS, RISK_DAYS, PRECISION, coverage_metrics, shortfall
 
 
 def cents(value: float) -> Decimal:
@@ -46,6 +48,7 @@ def build_dashboard_metrics(
     La exposición por KPI puede superponerse y no representa una pérdida contable.
     """
     config = config or ReplenishmentConfig()
+    validate_sku_integrity(sales, catalog, inventory)
     cutoff = inventory.fecha_corte.iloc[0].normalize()
     if inventory.fecha_corte.nunique() != 1:
         raise EngineInputError("CORTES_MEZCLADOS", "El tablero requiere un único corte de inventario.")
@@ -70,7 +73,9 @@ def build_dashboard_metrics(
         recent.unidades_vendidas.where(~is_credit, -recent.unidades_vendidas.abs())
         + recent.unidades_bonificadas.where(~is_credit, -recent.unidades_bonificadas.abs())
     )
-    recent["margin"] = recent.net_revenue - recent.net_units * recent.sku_id.map(catalog.set_index("sku_id").costo_unitario_usd)
+    # Cualquier columna adicional con ese nombre en ventas no sustituye al catálogo.
+    recent = join_catalog(recent.drop(columns=["costo_unitario_usd"], errors="ignore"), catalog, ["costo_unitario_usd"])
+    recent["margin"] = recent.net_revenue - recent.net_units * recent.costo_unitario_usd
     margin_sum = recent.groupby("sku_id").margin.sum()
     observed_skus = set(sales.loc[days.lt(cutoff), "sku_id"])
     contributions = {str(sku): float(margin_sum.get(sku, 0)) if sku in observed_skus else None for sku in catalog.sku_id}
@@ -88,7 +93,7 @@ def build_dashboard_metrics(
         lots = inventory.loc[inventory.sku_id.eq(sku)]
         history = gross.loc[sku] if sku in known_skus else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
         profile = demand_profile(history, cutoff, config)
-        forecast = profile.forecast(cutoff, 14) if profile else [0.0] * 14
+        forecast = profile.forecast(cutoff, RISK_DAYS) if profile else [0.0] * RISK_DAYS
         fefo = simulate_fefo(lots, cutoff, forecast)
         available = fefo["usable_stock"] if not lots.empty else None
         # Cuenta exposición por lote, no por SKU: uno de sus lotes puede estar sano.
@@ -98,11 +103,17 @@ def build_dashboard_metrics(
         expiry_value = float(cents(expiry_units * item.costo_unitario_usd))
         expired_value = float(cents(expired_units * item.costo_unitario_usd))
         mean = profile.mean if profile else None
-        excess_units = max(0.0, available - 90 * mean) if available is not None and mean is not None else None
+        coverage = coverage_metrics(available, mean)
+        excess_units = coverage["excess"]
         excess_value = float(cents(excess_units * item.costo_unitario_usd)) if excess_units is not None else None
         # El riesgo es demanda no atendida en los días 0..13. Una llegada en el
         # día 14 no rescata ventas anteriores; FEFO evita contar stock vencido.
-        uncovered = fefo["uncovered_by_day"][13] if profile and not lots.empty else None
+        uncovered = shortfall(fefo["uncovered_by_day"][RISK_DAYS - 1]) if profile and not lots.empty else None
+        risk_14_days = None
+        if available == 0:
+            risk_14_days = True
+        elif uncovered is not None:
+            risk_14_days = uncovered > 0
         paid_share = None
         risk_value = None
         if profile:
@@ -117,13 +128,11 @@ def build_dashboard_metrics(
 
         if available is None:
             state = "sin_datos"
-        elif available == 0:
+        elif risk_14_days:
             state = "quiebre"
         elif profile is None:
             state = "sin_datos"
-        elif uncovered > 1e-9:
-            state = "quiebre"
-        elif excess_units > 1e-9:
+        elif coverage["overstock"]:
             state = "exceso"
         else:
             state = "optimo"
@@ -135,7 +144,8 @@ def build_dashboard_metrics(
             "clase_margen": margin_classes[sku], "margen_estimado_periodo_usd": float(cents(contributions[sku])) if contributions[sku] is not None else None,
             "estado_salud": state, "stock_disponible": fefo["raw_stock"] if not lots.empty else None,
             "stock_utilizable": available, "demanda_diaria_promedio": round(mean, 6) if mean is not None else None,
-            "cobertura_dias": round(available / mean, 2) if available is not None and mean is not None and mean > 0 else None,
+            "cobertura_dias": coverage["days"], "sobreinventario": coverage["overstock"],
+            "riesgo_quiebre_14_dias": risk_14_days,
             "sin_demanda_reciente": mean == 0 if mean is not None else False,
             "sin_historial": profile is None,
             "unidades_excedentes_90_dias": round(excess_units, 6) if excess_units is not None else None,
@@ -163,12 +173,13 @@ def build_dashboard_metrics(
             "skus_sin_estimacion_exceso": sum(row["capital_sobreinventario_usd"] is None for row in rows),
             "skus_clase_a_sin_estimacion_quiebre": sum(row["clase_volumen"] == "A" and row["venta_riesgo_quiebre_usd"] is None for row in rows),
         },
-        "parametros": {"ventana_dias": config.window_days, "dias_sobreinventario": 90, "dias_riesgo_quiebre": 14, "dias_riesgo_vencimiento": 120, "cortes_abc_margen": [0.8, 0.95]},
+        "parametros": {"ventana_dias": config.window_days, "dias_sobreinventario": EXCESS_DAYS, "dias_riesgo_quiebre": RISK_DAYS, "dias_riesgo_vencimiento": 120, "cortes_abc_margen": [0.8, 0.95], "decimales_cobertura_y_unidades": PRECISION},
         "criterios": {
             "capital": "Solo unidades utilizables por encima de 90 × demanda diaria ponderada, valoradas a costo actual; sin historial se excluyen.",
             "quiebre": "Venta a precio de lista de unidades pagadas no cubiertas en 14 días, solo clase A del catálogo; simula ETA y FEFO. No agrega impuestos ni flete.",
             "vencimiento": "Stock disponible de lotes con vida remanente estrictamente menor de 120 días, valorado a costo actual; incluye vencidos. Es exposición, no pérdida segura.",
             "salud": "Quiebre: stock utilizable cero o faltante proyectado en 14 días. Luego exceso >90 días. Óptimo: resto con demanda e inventario conocidos. Sin datos se separa.",
+            "precision": "Cobertura y cantidades se normalizan a seis decimales antes de decidir indicadores y alertas; 90 días exactos no es exceso. Los contadores usan estado_salud, no recalculan desde valores formateados.",
             "abc": "Volumen: ABC del catálogo. Margen: aporte neto estimado de ventas recientes, a costo actual y con NC normalizadas; clases acumuladas 80%/95% sobre contribuciones positivas. Cero o negativo es C; desconocido queda fuera.",
             "margen": "Venta neta normalizada menos costo actual × (unidades vendidas netas + bonos netos). Aproximación de margen bruto, no margen contable histórico ni recuperación de devoluciones dañadas.",
             "alcance": "Fecha del inventario como inicio del día; demanda observada sin corregir censura. Incluye SKU descontinuados para no ocultar capital inmovilizado. Los indicadores pueden superponerse y no se suman como pérdida total.",

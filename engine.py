@@ -13,13 +13,8 @@ from statistics import NormalDist
 
 import pandas as pd
 
-
-class EngineInputError(ValueError):
-    """Dato que el ETL admite, pero necesita aclaración antes de una OCS."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+from integrity import EngineInputError, validate_sku_integrity
+from stock_policy import coverage_metrics, quantity, shortfall
 
 
 @dataclass(frozen=True)
@@ -179,6 +174,7 @@ def simulate_fefo(lots: pd.DataFrame, cutoff: pd.Timestamp, forecast: list[float
 
 
 def money(quantity: int, unit_cost: float) -> float:
+    """Unidades × costo unitario del catálogo; únicamente redondeo a centavos."""
     return float((Decimal(quantity) * Decimal(str(unit_cost))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
@@ -193,9 +189,11 @@ def generate_suggested_order(
     ROP = pronóstico(L) + Z * sigma_diaria * sqrt(L).
     Objetivo = pronóstico(L+R) + Z * sigma_diaria * sqrt(L+R).
     Compra = max(0, objetivo - disponible_utilizable - tránsito_a_tiempo + merma_FEFO).
-    Con R=0 (predeterminado), objetivo y ROP coinciden. Se redondea solo al final.
+    Con R=0 (predeterminado), objetivo y ROP coinciden. Las decisiones usan
+    cantidades a seis decimales, iguales a las publicadas; USD a dos decimales.
     """
     config = config or ReplenishmentConfig()
+    validate_sku_integrity(sales, catalog, inventory)
     warnings, rows = [], []
     cutoff = inventory.fecha_corte.iloc[0].normalize()
     if inventory.fecha_corte.nunique() != 1:
@@ -242,7 +240,10 @@ def generate_suggested_order(
         losses_lead = fefo["losses_by_day"][lead]
         position_lead = fefo["usable_stock"] + transit_lead - losses_lead
         position = fefo["usable_stock"] + transit_eligible - fefo["losses"]
-        deficit = max(0.0, target - position)
+        # Comparar los mismos valores que recibe la tabla, no floats ocultos.
+        rop, target = quantity(rop), quantity(target)
+        position_lead, position = quantity(position_lead), quantity(position)
+        deficit = shortfall(target, position)
         status = "CALCULADO"
         if item.estado == "DESCONTINUADO":
             status = "DESCONTINUADO"
@@ -250,8 +251,10 @@ def generate_suggested_order(
             status = "INVENTARIO_DESCONOCIDO"
         elif profile is None:
             status = "SIN_HISTORIAL"
-        boxes = max(int(item.moq_cajas), ceil(round(deficit / int(item.unidades_por_caja), 12))) if deficit > 1e-9 and status == "CALCULADO" else 0
+        boxes = max(int(item.moq_cajas), ceil(Decimal(str(deficit)) / int(item.unidades_por_caja))) if deficit > 0 and status == "CALCULADO" else 0
         units = boxes * int(item.unidades_por_caja)
+        total_cost = money(units, item.costo_unitario_usd)
+        coverage = coverage_metrics(fefo["usable_stock"] if not lots.empty else None, profile.mean if profile else None)
         if status != "CALCULADO":
             warn(warnings, sku, status, "No se genera compra automática para este SKU; revise estado, inventario o historial.")
         if profile is not None and len(profile.daily) < 28:
@@ -260,7 +263,7 @@ def generate_suggested_order(
             warn(warnings, sku, "DEMANDA_RECIENTE_CERO", "No hay salidas facturadas en la ventana; revise inactividad o posibles rupturas históricas antes de interpretar demanda cero.")
         if fefo["expired_stock"] > 0:
             warn(warnings, sku, "STOCK_VENCIDO_EXCLUIDO", "Se excluyen unidades vencidas del stock utilizable.")
-        if fefo["losses"] > 1e-9:
+        if shortfall(fefo["losses"]) > 0:
             warn(warnings, sku, "RIESGO_VENCIMIENTO_FEFO", "Parte del stock vigente vencería antes de consumirse; se descuenta de la cobertura.")
         if transit_overdue > 0:
             warn(warnings, sku, "TRANSITO_ATRASADO_EXCLUIDO", "El tránsito con ETA anterior al corte requiere fecha confirmada y no reduce la compra.")
@@ -269,8 +272,9 @@ def generate_suggested_order(
         if transit_eligible > 0:
             warn(warnings, sku, "VENCIMIENTO_TRANSITO_DESCONOCIDO", "Se supone tránsito vigente al recibirlo; el esquema no informa su vencimiento.")
         # El acumulado a L-1 es la demanda no cubierta antes de recibir la nueva OC.
-        uncovered_lead = fefo["uncovered_by_day"][lead - 1] if lead > 0 else 0.0
-        if uncovered_lead > 1e-9:
+        uncovered_lead = shortfall(fefo["uncovered_by_day"][lead - 1]) if lead > 0 else 0.0
+        risk_before_arrival = uncovered_lead > 0 if profile and not lots.empty else None
+        if risk_before_arrival:
             warn(warnings, sku, "RIESGO_QUIEBRE_ANTES_RECEPCION", "La compra normal no evita el faltante previo a su llegada: revise urgencia o transferencia.")
         if lead == 0 and config.review_days == 0:
             warn(warnings, sku, "HORIZONTE_CERO", "Con plazo y revisión cero el objetivo es cero; configure un horizonte para planificar cobertura.")
@@ -295,22 +299,24 @@ def generate_suggested_order(
             "stock_en_transito_fuera_horizonte": transit_late,
             "lead_time_dias": lead,
             "demanda_diaria_ponderada": round(profile.mean, 6) if profile else None,
+            "cobertura_dias": coverage["days"], "sobreinventario": coverage["overstock"],
             "desviacion_diaria_residual": round(profile.sigma, 6) if profile else None,
             "dias_historial_utilizados": len(profile.daily) if profile else 0,
             "modelo": "ponderado_estacional_semanal" if profile and profile.seasonal else "ponderado" if profile else "sin_historial",
             "pronostico_demanda_lead_time": round(demand_lead, 6) if profile else None,
             "stock_seguridad": round(safety_lead, 6) if profile else None,
             "punto_reorden": round(rop, 6) if profile else None,
-            "bajo_punto_reorden": position_lead < rop if profile and not lots.empty else None,
+            "bajo_punto_reorden": shortfall(rop, position_lead) > 0 if profile and not lots.empty else None,
             "posicion_inventario_lead_time": round(position_lead, 6) if not lots.empty else None,
             "objetivo_cobertura_unidades": round(target, 6) if profile else None,
             "posicion_inventario_horizonte": round(position, 6) if not lots.empty else None,
-            "merma_proyectada_fefo": round(fefo["losses"], 6),
+            "merma_proyectada_fefo": quantity(fefo["losses"]),
             "stock_fisico_proyectado_horizonte": round(fefo["physical_remaining"], 6) if not lots.empty else None,
             "demanda_no_cubierta_antes_recepcion": round(uncovered_lead, 6) if profile else None,
+            "riesgo_quiebre_antes_recepcion": risk_before_arrival,
             "unidades_por_caja": int(item.unidades_por_caja), "moq_cajas": int(item.moq_cajas),
             "cantidad_sugerida_cajas": boxes, "cantidad_sugerida_unidades": units,
-            "costo_total_usd": money(units, item.costo_unitario_usd), "prioridad_fefo": fefo["lots"],
+            "costo_total_usd": total_cost, "prioridad_fefo": fefo["lots"],
         })
     suppliers = []
     for supplier in sorted({row["proveedor_id"] for row in rows}):

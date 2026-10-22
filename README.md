@@ -381,3 +381,46 @@ Las nueve celdas más los desconocidos suman todos los SKU.
 El JSON también devuelve `detalle_skus`, `criterios`, `salud_catalogo`,
 `matriz_abc`, `parametros` y avisos del ETL. La interfaz permite abrir cada KPI,
 estado de salud o celda ABC para revisar los SKU que lo explican.
+
+## Integridad de SKU, costos y límites decimales
+
+`integrity.py` concentra los contratos de claves. Los cruces con el catálogo
+usan explícitamente `on="sku_id"`, `how="left"` y `validate="many_to_one"`,
+sin unir por índice ni por posición. Restablecer el índice antes del cruce no
+cambia la identidad de los productos. Un SKU desconocido o un catálogo ambiguo
+se rechaza antes de calcular; no se selecciona una coincidencia arbitraria.
+
+La carga de catálogo exige `sku_id` único tras recortar espacios y devuelve
+HTTP 422 con `SKU_DUPLICADO` si se repite. Ventas puede tener múltiples
+movimientos del mismo SKU e inventario varios lotes/bodegas. La clave única
+del inventario es `fecha_corte + bodega_id + sku_id + lote`; no se deduplica
+ni se exige SKU único a esa granularidad. Los motores también comprueban
+estas claves cuando se invocan directamente desde Python.
+
+El importe OCS es exclusivamente `cantidad_sugerida_unidades × costo_unitario_usd`
+del catálogo, con `Decimal` y redondeo `ROUND_HALF_UP` a centavos. MOQ y cajas
+afectan las unidades compradas, nunca el costo unitario. La exportación utiliza
+la misma función; las columnas adicionales en ventas/inventario no sustituyen
+el costo ni el tamaño de caja del catálogo.
+
+`stock_policy.py` comparte cobertura y comparación de cantidades entre OCS y
+tablero. Ambas se normalizan a **seis decimales**, antes de generar las banderas,
+los avisos y sus contadores. Cobertura de 90 días exactos no es sobreinventario;
+90,004 sí lo es y se conserva en el JSON y en la tabla, sin mostrarlo como 90.
+Los residuos inferiores a la precisión publicada no generan compras ni alertas.
+Un producto con historial conocido y demanda reciente cero mantiene la condición
+de stock sin rotación; un historial desconocido no se interpreta como cero.
+
+Las respuestas añaden `sobreinventario` y `cobertura_dias` comunes a ambos motores,
+`riesgo_quiebre_antes_recepcion` para OCS y `riesgo_quiebre_14_dias` para tablero.
+Los contadores de salud se calculan desde el mismo `estado_salud` de las filas;
+la bandera OCS y su aviso usan el mismo faltante publicado. Los horizontes
+continúan siendo distintos: lead time del proveedor en OCS y 14 días en tablero.
+Por ello sus conteos de riesgo no tienen por qué ser iguales.
+
+Regresiones específicas (incluyen SKU-1000/SKU-1009 desordenados y con índices
+repetidos, costos distintos, duplicados, lotes válidos y límites decimales):
+
+```bash
+python -m unittest discover -s tests -p test_integrity.py -v
+```
