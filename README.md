@@ -1,8 +1,9 @@
-# Paso 1: ingesta y validación ETL
+# MVP: ingesta ETL y orden de compra sugerida
 
-FastAPI + Pandas para validar ventas, catálogo e inventario de una distribuidora.
-No contiene modelos ML ni interfaz de usuario. Los Excel originales no se modifican
-y las cargas se procesan en memoria, sin guardarlas.
+FastAPI + Pandas para validar ventas, catálogo e inventario de una distribuidora y
+generar sugerencias de compra con pronóstico base y estacionalidad semanal.
+Los Excel originales no se modifican y las cargas se procesan en memoria, sin guardarlas.
+No hay interfaz de usuario ni modelos entrenados con librerías externas.
 
 ## Ejecutar
 
@@ -134,5 +135,140 @@ python -m unittest discover -s tests -v
 Las pruebas generan libros sintéticos y cubren cargas multipart/locales/mixtas,
 esquemas, fechas, valores inválidos, relaciones SKU, NC de ambos signos, bonos,
 stock nulo, lotes, límites, CORS y preservación de originales.
+
+## Paso 2: orden de compra sugerida (OCS)
+
+El motor puro está en `engine.py`; `main.py` reutiliza la lectura y las validaciones
+del Paso 1 antes de invocarlo. No se utiliza el preview de cinco filas para calcular
+demanda. Se procesan todas las filas válidas, sin variables globales por cliente.
+No hacen falta dependencias nuevas.
+
+Con los archivos locales:
+
+```bash
+curl -sS -X POST \
+  'http://127.0.0.1:8000/api/v1/replenishment/suggested-order?ventana_dias=60&nivel_servicio=0.95&peso_estacional=0.5&dias_revision=0'
+```
+
+Con uploads, use los mismos campos multipart `ventas_historicas`, `catalogo_sku`
+e `inventario_actual` del primer endpoint. Se pueden mezclar uploads y archivos
+locales. La ingesta previa no guarda archivos ni un dataset: si antes cargó por
+multipart, debe volver a proporcionar los libros para generar la sugerencia.
+También puede probarlo en Swagger mediante `/docs`.
+
+| Parámetro | Predeterminado | Rango |
+| --- | ---: | --- |
+| `ventana_dias` | 60 | Entero entre 30 y 60 |
+| `nivel_servicio` | 0.95 | Mayor que 0.5 y menor que 1 |
+| `peso_estacional` | 0.5 | De 0 a 1; cero usa solo promedio ponderado |
+| `dias_revision` | 0 | Entero entre 0 y 30; cobertura adicional opcional |
+
+El corte se toma del inventario, no de la fecha del ordenador. Se pronostica desde
+el inicio de ese día, usando ventas de días anteriores. Las ventas del corte o
+posteriores se excluyen con advertencia. Se asume que el corte representa stock
+al inicio del día; si su ERP exporta cierres del día, alinee las fechas de entrada.
+No se aceptan horizontes `lead_time_dias + dias_revision` mayores de 730 días.
+
+### Pronóstico y fórmulas
+
+- La demanda observada diaria suma **unidades facturadas + bonificadas**. Las NC
+  siguen validadas por el ETL, pero no restan demanda del día en que se emitieron:
+  no tenemos la factura original ni evidencia de que la devolución se pueda revender.
+- Se reindexa a días calendario, incluyendo días sin movimientos con cero, desde
+  el máximo entre el inicio de la ventana y la primera factura histórica del SKU.
+  Antes de esa primera observación no se asume que el producto estaba activo.
+  El cero representa ausencia de ventas registradas, no prueba disponibilidad.
+- Con `n` días, se usan pesos `1, 2, ..., n`, donde el día más reciente pesa más:
+  `media = sum(peso * unidades) / sum(pesos)`.
+- El componente semanal calcula medias ponderadas por día de semana y factores
+  con promedio igual a uno. Se mezcla cada factor con uno según `peso_estacional`.
+  Requiere al menos cuatro observaciones de cada día de semana; de lo contrario se
+  usa el promedio ponderado. No se intenta aprender estacionalidad anual o feriados.
+- `sigma_diaria` es la desviación muestral ponderada de los residuos del perfil
+  semanal mezclado. La corrección del denominador es `sum(w) - sum(w²)/sum(w)`.
+  El stock de seguridad asume residuos diarios independientes y lead time fijo;
+  se usa `NormalDist().inv_cdf(nivel_servicio)`, no 0.95 como valor Z.
+
+```text
+L = lead_time_dias del catálogo de cada SKU
+R = dias_revision (0 por defecto)
+pronostico_L = suma de pronósticos diarios durante L días
+SS_L = Z × sigma_diaria × sqrt(L)
+ROP = pronostico_L + SS_L
+
+H = L + R
+objetivo_H = pronostico_H + Z × sigma_diaria × sqrt(H)
+posicion_H = disponible_utilizable + transito_a_tiempo - merma_FEFO_H
+faltante = max(0, objetivo_H - posicion_H)
+cajas = 0 si faltante == 0
+cajas = max(moq_cajas, ceil(faltante / unidades_por_caja)) si faltante > 0
+unidades = cajas × unidades_por_caja
+costo = unidades × costo_unitario_usd, redondeado a centavos
+```
+
+Con `R=0`, el objetivo coincide con el ROP. Si añade revisión, se utiliza la
+cobertura `L+R` para sugerir la compra; `bajo_punto_reorden` sigue comparando la
+posición al plazo L con el ROP de L. Un plazo cero sin revisión genera objetivo
+cero y una advertencia; puede añadir revisión para ese caso.
+
+### Tránsito y FEFO
+
+`stock_en_transito` en la tabla es el total original. Solo
+`stock_en_transito_a_tiempo` reduce la necesidad: ETA entre el corte y el final
+del horizonte, inclusive. El tránsito atrasado o posterior se expone por separado.
+No se restan las reservas otra vez: `stock_disponible` ya corresponde a venta.
+
+FEFO simula el consumo diario priorizando vencimiento, bodega y lote. El
+vencimiento es inclusivo y el tránsito se recibe al comienzo del día de su ETA.
+Se excluye stock ya vencido y se descuenta únicamente el remanente que vencería
+sin consumirse; un lote próximo a vencer que se consume a tiempo sí aporta cobertura.
+`prioridad_fefo` devuelve la secuencia, consumo y merma estimados por lote.
+No realiza movimientos de almacén.
+
+Las ocho columnas solicitadas se entregan por proveedor/SKU en `orden_sugerida`,
+junto a los campos auditables anteriores, unidades de compra y estado. Los costos
+son de mercancía, sin IVA ni flete. `resumen_proveedores` suma cajas y costos.
+`estado=exito` significa cálculo completado, no ausencia de riesgos. Revise
+`estado_sugerencia` y `advertencias` de cada SKU antes de aprobar una compra.
+
+Limitaciones explícitas de este paso:
+
+- No se compra automáticamente un SKU descontinuado, sin historial o sin registro
+  de inventario. La ausencia de inventario se devuelve como `null`, no como cero.
+  `LANZAMIENTO` con historial sí puede calcularse; se avisa si el historial es corto.
+- La señal actual de stock cero no reconstruye rupturas históricas ni corrige
+  demanda censurada: la predicción puede subestimar demanda perdida.
+- Si una misma OC/SKU repite tránsito en varios lotes/bodegas, se devuelve 422
+  `TRANSITO_OC_AMBIGUO`: hace falta desambiguar las líneas antes de sumarlas.
+- El tránsito no tiene fecha de caducidad propia en el esquema. Se supone vigente
+  durante el horizonte, con advertencia; no se le asigna el vencimiento del lote actual.
+- Se informa demanda sin cobertura antes de la llegada de una nueva compra. Una
+  compra que llega al final del plazo no soluciona una ruptura previa: requiere
+  urgencia o transferencia. La posición de inventario es una comparación de cobertura;
+  `stock_fisico_proyectado_horizonte` es la simulación de stock sin ventas perdidas
+  convertidas automáticamente en pedidos pendientes.
+- Al consolidar varias bodegas se supone transferibilidad y se avisa, porque ventas
+  no tiene bodega. No se optimizan rutas ni se distribuyen compras por almacén.
+- Se aplica MOQ **por SKU del catálogo**. No se incorporan aún MOQ global del proveedor,
+  días de pedido ni feriados de los archivos auxiliares. El plazo del catálogo
+  prevalece para este cálculo, sin sustituirlo por el maestro de proveedores.
+- Se avisa si la compra supera la demanda estimada en la vida útil nominal. La vida
+  residual del lote entrante debe confirmarse antes de emitir una OC.
+
+Uso directo desde Python, con DataFrames ya tipados y validados por el ETL:
+
+```python
+import pandas as pd
+from engine import ReplenishmentConfig, generate_suggested_order
+
+resultado = generate_suggested_order(
+    ventas, catalogo, inventario,
+    ReplenishmentConfig(window_days=60, service_level=0.95),
+)
+tabla_ocs = pd.DataFrame(resultado["orden_sugerida"])
+```
+
+Las pruebas del motor verifican valores numéricos conocidos de media, ROP, cajas,
+costo, fecha de tránsito y consumo FEFO, además de la integración y regresión ETL.
 
 Ver [INFORME_DATOS.md](INFORME_DATOS.md) para los resultados de los nueve adjuntos.

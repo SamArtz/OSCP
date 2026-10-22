@@ -1,4 +1,4 @@
-"""Paso 1: ingesta Excel y validación ETL, sin persistencia ni modelos ML.
+"""Ingesta Excel, validación ETL y orden de compra sugerida, sin persistencia.
 
 Ejecutar: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 Los archivos originales se conservan; todas las transformaciones son en memoria.
@@ -22,6 +22,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+
+from engine import EngineInputError, ReplenishmentConfig, generate_suggested_order
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).resolve()
@@ -62,7 +64,7 @@ SCHEMAS = {
     },
 }
 
-app = FastAPI(title="Ingesta y validación de demanda", version="0.1.0")
+app = FastAPI(title="Demanda y reabastecimiento B2B", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -290,7 +292,8 @@ def process(tables, warnings, limit):
     }
 
 
-def validate_contents(contents, summary, errors, limit, status_code=200):
+def load_validated_tables(contents, summary, errors, status_code=200):
+    """Fuente compartida del ETL y OCS: nunca usa el preview como dataset."""
     tables, warnings = {}, []
     for name, content in contents.items():
         try:
@@ -304,12 +307,38 @@ def validate_contents(contents, summary, errors, limit, status_code=200):
             tables[name] = df
     if not errors:
         validate_business(tables, errors, warnings)
+    return tables, warnings, status_code
+
+
+def validate_contents(contents, summary, errors, limit, status_code=200):
+    tables, warnings, status_code = load_validated_tables(contents, summary, errors, status_code)
     result = {"estado": "error" if errors else "exito", "resumen": summary, "errores": errors, "advertencias": warnings, "preview": {}}
     if errors:
         return JSONResponse(status_code=error_status(status_code, 422), content=result)
     processed = process(tables, warnings, limit)
     result["resumen_procesamiento"] = {k: v for k, v in processed.items() if k != "preview"}
     result["preview"] = processed["preview"]
+    return JSONResponse(content=result)
+
+
+def replenishment_contents(contents, summary, errors, config, status_code=200):
+    tables, warnings, status_code = load_validated_tables(contents, summary, errors, status_code)
+    result = {
+        "estado": "error", "resumen": summary, "errores": errors,
+        "advertencias": warnings, "orden_sugerida": [], "resumen_proveedores": [],
+    }
+    if errors:
+        return JSONResponse(status_code=error_status(status_code, 422), content=result)
+    try:
+        suggestion = generate_suggested_order(
+            tables["ventas_historicas"], tables["catalogo_sku"], tables["inventario_actual"], config
+        )
+    except EngineInputError as exc:
+        issue(errors, "ocs", exc.code, str(exc))
+        return JSONResponse(status_code=422, content=result)
+    result.update(suggestion)
+    result["estado"] = "exito"
+    result["advertencias"] = warnings + suggestion["advertencias"]
     return JSONResponse(content=result)
 
 
@@ -328,24 +357,17 @@ def read_local(name):
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request: Request, exc: RequestValidationError):
     # No devolver el input de Pydantic: puede incluir contenido binario del usuario.
-    return JSONResponse(status_code=422, content={
+    content = {
         "estado": "error", "resumen": {}, "preview": {}, "advertencias": [],
         "errores": [{"codigo": "SOLICITUD_INVALIDA", "mensaje": item["msg"], "campo": list(item["loc"])} for item in exc.errors()],
-    })
+    }
+    if request.url.path == "/api/v1/replenishment/suggested-order":
+        content.update(orden_sugerida=[], resumen_proveedores=[])
+    return JSONResponse(status_code=422, content=content)
 
 
-@app.post("/api/v1/ingest/validate")
-async def ingest_validate(
-    ventas_historicas: UploadFile | None = File(default=None),
-    catalogo_sku: UploadFile | None = File(default=None),
-    inventario_actual: UploadFile | None = File(default=None),
-    preview_limit: int = Query(default=5, ge=1, le=20),
-):
-    """Cada upload omitido se busca en DATA_DIR (por defecto, junto a main.py).
-
-    Solo valida y procesa en memoria: no guarda uploads ni modifica los Excel.
-    Una respuesta 200 puede contener advertencias; 422 indica datos inválidos.
-    """
+async def collect_sources(ventas_historicas, catalogo_sku, inventario_actual):
+    """Mismos orígenes y límites en los dos endpoints, sin guardar uploads."""
     uploads = dict(zip(SCHEMAS, [ventas_historicas, catalogo_sku, inventario_actual]))
     contents, summary, errors = {}, {}, []
     status_code = 200
@@ -367,5 +389,46 @@ async def ingest_validate(
         finally:
             if upload is not None:
                 await upload.close()
+    return contents, summary, errors, status_code
+
+
+@app.post("/api/v1/ingest/validate")
+async def ingest_validate(
+    ventas_historicas: UploadFile | None = File(default=None),
+    catalogo_sku: UploadFile | None = File(default=None),
+    inventario_actual: UploadFile | None = File(default=None),
+    preview_limit: int = Query(default=5, ge=1, le=20),
+):
+    """Cada upload omitido se busca en DATA_DIR (por defecto, junto a main.py).
+
+    Solo valida y procesa en memoria: no guarda uploads ni modifica los Excel.
+    Una respuesta 200 puede contener advertencias; 422 indica datos inválidos.
+    """
+    contents, summary, errors, status_code = await collect_sources(
+        ventas_historicas, catalogo_sku, inventario_actual
+    )
     # Pandas/openpyxl son bloqueantes: no se ejecutan sobre el event loop.
     return await run_in_threadpool(validate_contents, contents, summary, errors, preview_limit, status_code)
+
+
+@app.post("/api/v1/replenishment/suggested-order")
+async def suggested_order(
+    ventas_historicas: UploadFile | None = File(default=None),
+    catalogo_sku: UploadFile | None = File(default=None),
+    inventario_actual: UploadFile | None = File(default=None),
+    ventana_dias: int = Query(default=60, ge=30, le=60),
+    nivel_servicio: float = Query(default=0.95, gt=0.5, lt=1),
+    peso_estacional: float = Query(default=0.5, ge=0, le=1),
+    dias_revision: int = Query(default=0, ge=0, le=30),
+):
+    """Valida los tres libros y devuelve OCS por proveedor/SKU y detalle FEFO.
+
+    Sin archivos usa DATA_DIR. No hay estado compartido con la ingesta previa:
+    los uploads se deben aportar otra vez. No guarda ni emite órdenes reales.
+    ROP usa el plazo del catálogo. dias_revision añade cobertura opcional al plazo.
+    """
+    config = ReplenishmentConfig(ventana_dias, nivel_servicio, peso_estacional, dias_revision)
+    contents, summary, errors, status_code = await collect_sources(
+        ventas_historicas, catalogo_sku, inventario_actual
+    )
+    return await run_in_threadpool(replenishment_contents, contents, summary, errors, config, status_code)
