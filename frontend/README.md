@@ -95,7 +95,8 @@ La predicción es el baseline del Paso 2; la etiqueta “IA” no implica un mod
 adicional o un LLM.
 
 Los ajustes y archivos viven solo en memoria durante la sesión: recargar o
-recalcular descarta los ajustes. Se pide confirmación antes de recalcular si hay
+recalcular descarta los ajustes. Los archivos y la ventana se comparten entre
+mesa y tablero al navegar en la misma pestaña; una recarga completa los descarta. Se pide confirmación antes de recalcular si hay
 cambios. Solo se conserva la preferencia de tema en `localStorage`.
 
 ## Formato de descarga elegido
@@ -202,3 +203,33 @@ python frontend/tests/dashboard_browser_smoke.py
 Reutiliza Playwright y las variables opcionales descritas en la prueba de la mesa.
 Comprueba KPI contra el GET real, filtros, carga multipart, navegación con OCS,
 temas, móvil y conservación del cálculo anterior si falla una actualización.
+
+
+## Consistencia de salud y presentación
+
+La mesa OCS y el tablero consumen `estado_salud` calculado por el backend con
+FEFO a 14 días. La mesa ya no obtiene su contador desde los avisos de lead time:
+esos avisos se consultan como urgencias separadas. El cliente verifica SKU únicos
+y que `salud_catalogo` coincida con las filas; requiere actualizar ambos servicios.
+Los productos descontinuados conservan su estado de salud visible aunque la
+compra esté bloqueada, para que los badges no oculten riesgos contados.
+
+Cobertura se presenta con un decimal máximo (615.3 d). El tooltip conserva la
+precisión original; los filtros usan el estado recibido, sin recalcular desde
+el texto redondeado. El pronóstico muestra en su tooltip la fórmula de pesos y
+las fechas exactas de su ventana, tomadas de `auditoria_demanda`.
+
+Los importes editados usan `lib/money.ts`: unidades por costo decimal del catálogo
+y redondeo HALF_UP a centavos, igual que el XLSX del servidor. Una respuesta con
+costos incompatibles con esa fórmula se rechaza antes de mostrar la mesa.
+
+
+Las fuentes y la ventana se comparten mediante `components/dataset-provider.tsx`,
+montado en el layout raíz. Ambas vistas recalculan desde esa misma selección.
+El indicador de fuentes permite distinguir archivos cargados y archivos del
+servicio. Los documentos no se escriben en localStorage ni en el servidor.
+Para comprobarlo con copias temporales diferentes de los originales:
+
+```bash
+python frontend/tests/dataset_browser_smoke.py
+```

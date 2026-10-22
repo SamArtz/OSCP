@@ -5,9 +5,11 @@ CHROMIUM_PATH permite usar un Chromium ya instalado. No genera compras reales.
 """
 
 import os
+import re
 from pathlib import Path
 import shutil
 import tempfile
+from decimal import Decimal, ROUND_HALF_UP
 
 from openpyxl import load_workbook
 from playwright.sync_api import expect, sync_playwright
@@ -32,6 +34,29 @@ def run():
             data = received.value.json()
             assert data["estado"] == "exito", data
             expect(page.get_by_text("Datos validados", exact=True)).to_be_visible()
+            dashboard = page.request.get(os.getenv("FRONTEND_URL", "http://127.0.0.1:3000") + "/api/dashboard?ventana_dias=60").json()
+            assert data["huella_datos"] == dashboard["huella_datos"]
+            assert data["salud_catalogo"] == dashboard["salud_catalogo"]
+            expected_risk = data["salud_catalogo"]["quiebre"]
+            metric = page.locator(".metric-card").filter(has_text="RIESGO DE QUIEBRE")
+            expect(metric.locator(".metric-value")).to_have_text(str(expected_risk))
+            expect(page.locator(".attention-strip")).to_contain_text(f"{expected_risk} SKU en quiebre o riesgo a 14 días")
+            search = page.get_by_label("Buscar SKU, descripción o marca")
+            for sku in ["SKU-1009", "SKU-1029"]:
+                source = next((row for row in data["orden_sugerida"] if row["sku_id"] == sku), None)
+                if source is None:
+                    continue
+                search.fill(sku)
+                expect(page.locator("tbody tr")).to_have_count(1)
+                expect(page.locator("tbody td").nth(4).locator("span").first).to_have_text(f"{source['stock_disponible']:,}")
+                expect(page.locator("tbody td").nth(5).locator("span").first).to_have_text(f"{source['stock_en_transito']:,}")
+                expect(page.locator("tbody td").nth(6).locator("span").first).to_have_attribute("title", re.compile("sum\\(w_t"))
+            search.fill("")
+            page.get_by_role("button", name="Riesgo de quiebre", exact=False).click()
+            expect(page.locator("tbody tr")).to_have_count(min(expected_risk, 10))
+            assert all("Quiebre / riesgo" in text for text in page.locator("tbody .status-badge").all_text_contents())
+            page.get_by_role("button", name="Todos", exact=False).click()
+            print("PASS: salud OCS/dashboard coherente, banner/filtro/badges, SKU-1009/1029 y fórmula auditable", flush=True)
             first = next(field for field in page.locator('input[type="number"]:enabled').all() if int(field.input_value()) > 0)
             sku = first.get_attribute("aria-label").removeprefix("Cajas confirmadas ")
             source_row = next(row for row in data["orden_sugerida"] if row["sku_id"] == sku)
@@ -73,6 +98,14 @@ def run():
             downloaded.value.save_as(target)
             book = load_workbook(target)
             lines = list(book["Orden_Compra"].values)[1:]
+            catalog_costs = {row["sku_id"]: Decimal(str(row["costo_unitario_usd"])) for row in data["orden_sugerida"]}
+            exported_total = Decimal(0)
+            for line in lines:
+                assert Decimal(str(line[7])) == catalog_costs[line[1]]
+                expected_cost = (Decimal(line[6]) * catalog_costs[line[1]]).quantize(Decimal(".01"), rounding=ROUND_HALF_UP)
+                assert Decimal(str(line[8])) == expected_cost
+                exported_total += expected_cost
+            expect(page.locator(".summary-total strong")).to_have_text(f"${exported_total:,.2f}")
             assert next(line for line in lines if line[1] == sku)[4] == original + 1
             expected = sum(row["cantidad_sugerida_cajas"] > 0 and row["estado_sugerencia"] == "CALCULADO" for row in data["orden_sugerida"])
             assert len(lines) == expected

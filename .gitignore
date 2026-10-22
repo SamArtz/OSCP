@@ -12,3 +12,5 @@ out/
 .env.local
 playwright-report/
 test-results/
+# Conciliaciones locales: pueden contener datos comerciales derivados.
+reports/

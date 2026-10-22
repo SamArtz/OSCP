@@ -53,3 +53,23 @@ def join_catalog(frame: pd.DataFrame, catalog: pd.DataFrame, columns: list[str])
     )
     joined.index = frame.index.copy()
     return joined
+
+
+def catalog_with_inventory(catalog: pd.DataFrame, inventory: pd.DataFrame) -> pd.DataFrame:
+    """Consolida lotes antes del cruce uno-a-uno; mantiene físico y tránsito separados.
+
+    No cruza movimientos de venta contra lotes: eso multiplicaría las existencias.
+    Las columnas de stock proceden exclusivamente del inventario, aun si hay
+    columnas adicionales con esos nombres en el catálogo.
+    """
+    validate_sku_keys(catalog, "catalogo_sku", unique=True)
+    validate_sku_keys(inventory, "inventario_actual")
+    if not inventory.sku_id.isin(catalog.sku_id).all():
+        raise EngineInputError("SKU_DESCONOCIDO", "Inventario contiene SKU ausentes del catálogo.")
+    totals = inventory.groupby("sku_id", as_index=False).agg(
+        stock_disponible=("stock_disponible", "sum"),
+        stock_en_transito=("stock_en_transito", "sum"),
+    )
+    return catalog.drop(columns=["stock_disponible", "stock_en_transito"], errors="ignore").reset_index(drop=True).merge(
+        totals, on="sku_id", how="left", validate="one_to_one", sort=False,
+    )

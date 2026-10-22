@@ -372,6 +372,7 @@ def dashboard_contents(contents, summary, errors, config, status_code=200):
         return JSONResponse(status_code=422, content=result, headers={"Cache-Control": "no-store"})
     result.update(metrics)
     result["estado"] = "exito"
+    result["huella_datos"] = source_fingerprint(contents)
     result["advertencias"] = warnings + metrics["advertencias"]
     return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
 

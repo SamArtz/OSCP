@@ -1,4 +1,6 @@
 import type { OCSResponse, OCSRow, Sources } from "./types";
+import { validateHealthSummary } from "./sku-state.ts";
+import { lineCost } from "./money.ts";
 
 export function sourceForm(sources: Sources) {
   const form = new FormData();
@@ -24,6 +26,10 @@ export function validateResponse(body: unknown): OCSResponse {
     typeof row.clasificacion_abc !== "string" || !Number.isFinite(row.costo_unitario_usd) ||
     !Number.isInteger(row.unidades_por_caja) || row.unidades_por_caja <= 0
   )) throw new Error("Actualiza FastAPI al Paso 3: faltan los metadatos de catálogo o la versión de datos necesaria para exportar.");
+  validateHealthSummary(candidate.orden_sugerida, candidate.salud_catalogo);
+  if (candidate.orden_sugerida.some(row => row.costo_total_usd !== lineCost(row.cantidad_sugerida_unidades, row.costo_unitario_usd))) {
+    throw new Error("El costo de una línea no coincide con unidades × costo unitario del catálogo. Recalcula la orden.");
+  }
   return candidate;
 }
 

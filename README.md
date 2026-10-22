@@ -318,8 +318,9 @@ Paso 2. No se utilizan cifras inventadas si falta el histórico.
 
 El `GET` lee los tres libros de `DATA_DIR`. Existe además `POST` en la misma
 ruta con los tres uploads opcionales para la carga desde la interfaz. Los
-archivos cargados en otra página no se conservan: cada pantalla debe cargarlos
-o utilizar los archivos locales del servicio.
+archivos y la ventana se comparten entre mesa y tablero mientras se navega en
+la misma pestaña. No se persisten en el servidor: al recargar la pestaña se
+descartan los uploads y se vuelve a los archivos locales con ventana de 60 días.
 
 ### Definiciones de los indicadores
 
@@ -402,11 +403,15 @@ del catálogo, con `Decimal` y redondeo `ROUND_HALF_UP` a centavos. MOQ y cajas
 afectan las unidades compradas, nunca el costo unitario. La exportación utiliza
 la misma función; las columnas adicionales en ventas/inventario no sustituyen
 el costo ni el tamaño de caja del catálogo.
+`price_suggested_lines()` valora las líneas una sola vez al terminar el cálculo
+de unidades: cruza de nuevo las claves de la orden con el catálogo original y
+descarta cualquier costo o total que trajeran las filas intermedias. Los resúmenes
+por proveedor suman exclusivamente los importes resultantes de esa valoración.
 
 `stock_policy.py` comparte cobertura y comparación de cantidades entre OCS y
 tablero. Ambas se normalizan a **seis decimales**, antes de generar las banderas,
 los avisos y sus contadores. Cobertura de 90 días exactos no es sobreinventario;
-90,004 sí lo es y se conserva en el JSON y en la tabla, sin mostrarlo como 90.
+90,004 sí lo es y se conserva en el JSON. La tabla muestra un decimal y su tooltip permite consultar el valor exacto; el formato visual no recalcula el estado.
 Los residuos inferiores a la precisión publicada no generan compras ni alertas.
 Un producto con historial conocido y demanda reciente cero mantiene la condición
 de stock sin rotación; un historial desconocido no se interpreta como cero.
@@ -414,13 +419,92 @@ de stock sin rotación; un historial desconocido no se interpreta como cero.
 Las respuestas añaden `sobreinventario` y `cobertura_dias` comunes a ambos motores,
 `riesgo_quiebre_antes_recepcion` para OCS y `riesgo_quiebre_14_dias` para tablero.
 Los contadores de salud se calculan desde el mismo `estado_salud` de las filas;
-la bandera OCS y su aviso usan el mismo faltante publicado. Los horizontes
-continúan siendo distintos: lead time del proveedor en OCS y 14 días en tablero.
-Por ello sus conteos de riesgo no tienen por qué ser iguales.
+la bandera OCS de urgencia y su aviso usan el mismo faltante publicado.
+`calcular_estado_sku()` es la única clasificación de salud para ambos endpoints,
+con horizonte fijo de 14 días y prioridad quiebre → exceso → óptimo; sin datos
+se separa. Mesa, donut, badges y filtros consumen `estado_salud`. El frontend
+valida que los contadores coincidan con las filas y rechaza SKU repetidos.
+Los avisos `RIESGO_QUIEBRE_ANTES_RECEPCION` conservan el horizonte del proveedor
+y ya no se usan para contar la salud del catálogo.
 
 Regresiones específicas (incluyen SKU-1000/SKU-1009 desordenados y con índices
 repetidos, costos distintos, duplicados, lotes válidos y límites decimales):
 
 ```bash
 python -m unittest discover -s tests -p test_integrity.py -v
+```
+
+
+### Pronóstico reproducible y costos de línea
+
+Cada SKU con histórico incluye `auditoria_demanda`, tanto en OCS como en tablero:
+fechas exactas de la ventana, número de días, suma de pesos, suma de demanda por
+peso, media y sigma sin redondear y siete factores semanales de lunes a domingo.
+El tooltip del pronóstico muestra la fórmula y su ventana. `huella_datos` en
+ambos endpoints permite comprobar que se usaron los mismos tres libros.
+
+Con n días calendario anteriores al corte, d_t = unidades vendidas + bonificadas
+en FACTURA, y w_t = 1..n (más peso a lo reciente):
+
+```text
+media = sum(w_t * d_t) / sum(w_t)
+m_j = sum(w_t * d_t en día de semana j) / sum(w_t en día j)
+nivel = promedio simple de los siete m_j
+factor_j = (1 - peso_estacional) + peso_estacional * m_j / nivel
+pronostico_horizonte = sum(media * factor_dia_semana)
+```
+
+Sin al menos cuatro observaciones por día de semana, o sin estacionalidad, los
+factores valen uno. Se completa con cero cada día sin movimiento desde la primera
+factura conocida o el inicio de la ventana, el que sea posterior. Se excluyen
+NC del pronóstico y ventas del corte o posteriores. Los parámetros predeterminados
+son ventana de 60 días, peso estacional 0,5 y servicio 0,95. La sigma es la
+desviación residual ponderada documentada en el Paso 2; el ROP y MOQ no cambian
+el costo unitario del catálogo.
+
+El catálogo se cruza uno-a-uno con inventario **ya agregado por SKU**, manteniendo
+`stock_disponible` y `stock_en_transito` en columnas separadas. Nunca se unen
+movimientos de ventas sin agregar contra lotes: eso multiplicaría existencias.
+La multiplicación de unidades por costo se redondea a centavos una vez por línea;
+el resumen suma esos importes. Los ajustes del comprador usan la misma regla
+HALF_UP mediante aritmética decimal con BigInt en el cliente y Decimal al exportar.
+No se aplica IVA, flete, factores de escala ni cambios al precio para hacer coincidir
+un total esperado. Las cantidades dependen de la ventana, estacionalidad, servicio,
+FEFO, ETA y MOQ; una discrepancia de importe debe reconciliar esas líneas.
+
+Pruebas adicionales de salud, stock físico/tránsito y auditabilidad:
+
+```bash
+python -m unittest discover -s tests -p test_consistency.py -v
+```
+
+
+## Conciliación completa de los tres Excel
+
+```bash
+python audit.py --data-dir . --output-dir reports
+```
+
+El verificador usa los Excel indicados como única fuente. Contrasta los SKU,
+descripciones, proveedores, stock físico y tránsito, precios, cantidades y MOQ;
+recalcula desde ventas la media ponderada, los factores semanales, sigma,
+pronóstico, seguridad y ROP. Comprueba los estados por SKU entre dashboard y OCS,
+los contadores, las sumas de KPI/proveedor y cada línea de la exportación XLSX.
+Un desacuerdo termina con error y señala el SKU/campo; no cambia el archivo para
+hacer coincidir el total. Las hojas Diccionario no se ejecutan como instrucciones.
+
+Genera `reports/conciliacion_ocs.xlsx` (50 SKU en los adjuntos actuales),
+`reports/conciliacion_ocs.json` (huellas SHA-256, parámetros, métricas y avisos) y
+`reports/orden_compra_verificada.xlsx` (la orden exacta que exporta el servicio).
+La carpeta reports está excluida de Git por contener datos comerciales derivados.
+No modifica los Excel de entrada. `--ventana-dias 30` permite otra ventana.
+
+En el frontend, `DatasetProvider` conserva los mismos archivos File y ventana
+para ambas pantallas mientras se navega en la pestaña. Cada página indica si
+usa fuentes del servicio, archivos cargados o una mezcla. Una prueba de navegador
+con copias temporales deliberadamente distintas comprueba que cambiar de página
+no regrese silenciosamente a los archivos del servidor:
+
+```bash
+python frontend/tests/dataset_browser_smoke.py
 ```

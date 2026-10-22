@@ -1,7 +1,11 @@
-import type { Edits, OCSRow, Warning } from "./types.ts";
+import type { Edits, OCSRow } from "./types.ts";
+import { isCritical } from "./sku-state.ts";
+import { lineCostCents } from "./money.ts";
+export { isCritical } from "./sku-state.ts";
 
 export const usd = (value: number) => new Intl.NumberFormat("es-SV", { style: "currency", currency: "USD" }).format(value);
 export const number = (value: number | null, digits = 0) => value === null ? "—" : new Intl.NumberFormat("es-SV", { maximumFractionDigits: digits }).format(value);
+export const coverageLabel = (value: number | null) => value === null ? "—" : `${number(value, 1)} d`;
 export const dateLabel = (value: string) => new Intl.DateTimeFormat("es-SV", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 export const rowKey = (row: Pick<OCSRow, "proveedor_id" | "sku_id">) => JSON.stringify([row.proveedor_id, row.sku_id]);
 export const canBuy = (row: OCSRow) => row.estado_sugerencia === "CALCULADO" && row.estado_sku !== "DESCONTINUADO";
@@ -19,16 +23,15 @@ export function quantityError(row: OCSRow, value: string): string | null {
   return null;
 }
 export const isAdjusted = (row: OCSRow, edits: Edits) => boxText(row, edits) !== String(row.cantidad_sugerida_cajas);
-export const isCritical = (row: OCSRow, warnings: Warning[]) => warnings.some(w => w.sku_id === row.sku_id && w.codigo === "RIESGO_QUIEBRE_ANTES_RECEPCION");
 export const normalize = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-export function filterRows(rows: OCSRow[], filters: { supplier: string; category: string; brand: string; search: string; view: string }, edits: Edits, warnings: Warning[]) {
+export function filterRows(rows: OCSRow[], filters: { supplier: string; category: string; brand: string; search: string; view: string }, edits: Edits) {
   const search = normalize(filters.search.trim());
   return rows.filter(row =>
     (!filters.supplier || row.proveedor_id === filters.supplier) &&
     (!filters.category || row.categoria === filters.category) &&
     (!filters.brand || row.marca === filters.brand) &&
     (!search || normalize(`${row.sku_id} ${row.nombre_producto} ${row.marca}`).includes(search)) &&
-    (filters.view !== "quiebre" || isCritical(row, warnings)) &&
+    (filters.view !== "quiebre" || isCritical(row)) &&
     (filters.view !== "compra" || (quantity(boxText(row, edits)) ?? 0) > 0) &&
     (filters.view !== "ajustes" || isAdjusted(row, edits))
   );
@@ -40,6 +43,6 @@ export function selectedOrder(rows: OCSRow[], selected: Set<string>, edits: Edit
   const lines = selectedRows.filter(row => !quantityError(row, boxText(row, edits)) && (quantity(boxText(row, edits)) ?? 0) > 0);
   const boxes = lines.reduce((sum, row) => sum + quantity(boxText(row, edits))!, 0);
   const units = lines.reduce((sum, row) => sum + quantity(boxText(row, edits))! * row.unidades_por_caja, 0);
-  const cents = lines.reduce((sum, row) => sum + Math.round(quantity(boxText(row, edits))! * row.unidades_por_caja * row.costo_unitario_usd * 100 + 1e-7), 0);
+  const cents = lines.reduce((sum, row) => sum + lineCostCents(quantity(boxText(row, edits))! * row.unidades_por_caja, row.costo_unitario_usd), 0);
   return { lines, invalid, boxes, units, total: cents / 100 };
 }

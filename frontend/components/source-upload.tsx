@@ -26,7 +26,7 @@ export function SourceUpload({ current, onCalculate, actionLabel = "Calcular sug
       <div className="min-w-0 flex-1"><label htmlFor={name}>{label}</label><p>{description}</p><input id={name} type="file" accept=".xlsx" onChange={event => select(name, event.target.files?.[0])} />{files[name] && <span className="file-name">{files[name]!.name} · {(files[name]!.size / 1024).toFixed(0)} KB <button type="button" onClick={() => { select(name); const input = document.getElementById(name) as HTMLInputElement; input.value = ""; }}>Quitar</button></span>}</div>
     </div>)}</div>
     {error && <p className="field-error" role="alert">{error}</p>}
-    <div className="source-note"><UploadCloud size={17} /><p>Los archivos se procesan en memoria. No se guardan en el navegador ni se agregan a GitHub.</p></div>
+    <div className="source-note"><UploadCloud size={17} /><p>Los archivos se comparten entre la mesa y el tablero en esta pestaña. Al recargar se descartan; no se guardan en el servidor ni se agregan a GitHub.</p></div>
     <button type="submit" className="button-primary w-full justify-center" disabled={!!error}>{actionLabel} <ArrowRight size={17} /></button>
   </form>;
 }

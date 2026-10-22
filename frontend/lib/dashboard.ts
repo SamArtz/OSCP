@@ -1,6 +1,8 @@
 import { normalize } from "./ocs.ts";
+import { healthStates, type HealthState } from "./sku-state.ts";
+export { healthLabels } from "./sku-state.ts";
+export type { HealthState } from "./sku-state.ts";
 
-export type HealthState = "quiebre" | "exceso" | "optimo" | "sin_datos";
 export type ExposureKey = "capital_sobreinventario_usd" | "venta_riesgo_quiebre_usd" | "inventario_riesgo_vencimiento_usd";
 export interface DashboardSKU {
   sku_id: string; nombre_producto: string; proveedor_id: string; categoria: string; marca: string; estado_sku: string;
@@ -24,7 +26,6 @@ export interface DashboardResponse {
   detalle_skus: DashboardSKU[];
 }
 
-export const healthLabels: Record<HealthState, string> = { quiebre: "Quiebre / riesgo", exceso: "En exceso", optimo: "Óptimos", sin_datos: "Sin datos suficientes" };
 export const healthColors: Record<HealthState, string> = { quiebre: "#c77868", exceso: "#cba25d", optimo: "#418d79", sin_datos: "#b3bec5" };
 export const exposureLabels: Record<ExposureKey, string> = {
   capital_sobreinventario_usd: "Capital en sobreinventario", venta_riesgo_quiebre_usd: "Venta en riesgo de quiebre", inventario_riesgo_vencimiento_usd: "Inventario próximo a vencer",
@@ -43,5 +44,5 @@ export function dashboardRows(rows: DashboardSKU[], options: { metric: ExposureK
 
 export function healthShares(health: DashboardResponse["salud_catalogo"]) {
   const total = Object.values(health).reduce((sum, value) => sum + value, 0);
-  return (Object.keys(healthLabels) as HealthState[]).map(key => ({ key, count: health[key], share: total ? health[key] / total : 0 }));
+  return healthStates.map(key => ({ key, count: health[key], share: total ? health[key] / total : 0 }));
 }

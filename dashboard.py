@@ -9,9 +9,9 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import pandas as pd
 
-from engine import EngineInputError, ReplenishmentConfig, demand_profile, simulate_fefo
-from integrity import join_catalog, validate_sku_integrity
-from stock_policy import EXCESS_DAYS, RISK_DAYS, PRECISION, coverage_metrics, shortfall
+from engine import EngineInputError, ReplenishmentConfig, demand_profile, evaluate_sku_state
+from integrity import catalog_with_inventory, join_catalog, validate_sku_integrity
+from stock_policy import EXCESS_DAYS, RISK_DAYS, PRECISION, count_sku_states
 
 
 def cents(value: float) -> Decimal:
@@ -81,20 +81,19 @@ def build_dashboard_metrics(
     contributions = {str(sku): float(margin_sum.get(sku, 0)) if sku in observed_skus else None for sku in catalog.sku_id}
     margin_classes = abc_margin(contributions)
 
-    health = dict(quiebre=0, exceso=0, optimo=0, sin_datos=0)
     rows, warnings = [], []
     if inventory.bodega_id.nunique() > 1:
         warnings.append({"codigo": "STOCK_CONSOLIDADO", "mensaje": "Se consolidan bodegas asumiendo transferencias posibles; ventas no informa bodega."})
     if days.ge(cutoff).any():
         warnings.append({"codigo": "VENTAS_DESDE_CORTE_EXCLUIDAS", "mensaje": "Las ventas del día del corte o posteriores se excluyen del pronóstico y del margen reciente."})
 
-    for item in catalog.sort_values("sku_id").itertuples(index=False):
+    master = catalog_with_inventory(catalog, inventory)
+    for item in master.sort_values("sku_id").itertuples(index=False):
         sku = str(item.sku_id)
         lots = inventory.loc[inventory.sku_id.eq(sku)]
         history = gross.loc[sku] if sku in known_skus else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
         profile = demand_profile(history, cutoff, config)
-        forecast = profile.forecast(cutoff, RISK_DAYS) if profile else [0.0] * RISK_DAYS
-        fefo = simulate_fefo(lots, cutoff, forecast)
+        health_state, fefo = evaluate_sku_state(lots, profile, cutoff)
         available = fefo["usable_stock"] if not lots.empty else None
         # Cuenta exposición por lote, no por SKU: uno de sus lotes puede estar sano.
         life = (lots.fecha_vencimiento_lote.dt.normalize() - cutoff).dt.days
@@ -103,17 +102,11 @@ def build_dashboard_metrics(
         expiry_value = float(cents(expiry_units * item.costo_unitario_usd))
         expired_value = float(cents(expired_units * item.costo_unitario_usd))
         mean = profile.mean if profile else None
-        coverage = coverage_metrics(available, mean)
-        excess_units = coverage["excess"]
+        excess_units = health_state["unidades_excedentes_90_dias"]
         excess_value = float(cents(excess_units * item.costo_unitario_usd)) if excess_units is not None else None
         # El riesgo es demanda no atendida en los días 0..13. Una llegada en el
         # día 14 no rescata ventas anteriores; FEFO evita contar stock vencido.
-        uncovered = shortfall(fefo["uncovered_by_day"][RISK_DAYS - 1]) if profile and not lots.empty else None
-        risk_14_days = None
-        if available == 0:
-            risk_14_days = True
-        elif uncovered is not None:
-            risk_14_days = uncovered > 0
+        uncovered = health_state["demanda_no_cubierta_14_dias"]
         paid_share = None
         risk_value = None
         if profile:
@@ -126,31 +119,19 @@ def build_dashboard_metrics(
         elif item.clasificacion_abc != "A":
             risk_value = 0.0
 
-        if available is None:
-            state = "sin_datos"
-        elif risk_14_days:
-            state = "quiebre"
-        elif profile is None:
-            state = "sin_datos"
-        elif coverage["overstock"]:
-            state = "exceso"
-        else:
-            state = "optimo"
-        health[state] += 1
         rows.append({
+            **health_state,
             "sku_id": sku, "nombre_producto": str(item.nombre_producto),
             "proveedor_id": str(item.proveedor_id), "categoria": str(item.categoria), "marca": str(item.marca),
             "estado_sku": str(item.estado), "clase_volumen": str(item.clasificacion_abc),
             "clase_margen": margin_classes[sku], "margen_estimado_periodo_usd": float(cents(contributions[sku])) if contributions[sku] is not None else None,
-            "estado_salud": state, "stock_disponible": fefo["raw_stock"] if not lots.empty else None,
+            "stock_disponible": int(item.stock_disponible) if not lots.empty else None,
+            "stock_en_transito": int(item.stock_en_transito) if not lots.empty else None,
             "stock_utilizable": available, "demanda_diaria_promedio": round(mean, 6) if mean is not None else None,
-            "cobertura_dias": coverage["days"], "sobreinventario": coverage["overstock"],
-            "riesgo_quiebre_14_dias": risk_14_days,
+            "auditoria_demanda": profile.audit() if profile else None,
             "sin_demanda_reciente": mean == 0 if mean is not None else False,
             "sin_historial": profile is None,
-            "unidades_excedentes_90_dias": round(excess_units, 6) if excess_units is not None else None,
             "capital_sobreinventario_usd": excess_value,
-            "demanda_no_cubierta_14_dias": round(uncovered, 6) if uncovered is not None else None,
             "proporcion_unidades_pagadas": round(paid_share, 6) if paid_share is not None else None,
             "venta_riesgo_quiebre_usd": risk_value,
             "unidades_lotes_menos_120_dias": expiry_units, "inventario_riesgo_vencimiento_usd": expiry_value,
@@ -167,7 +148,7 @@ def build_dashboard_metrics(
         "venta_riesgo_quiebre_usd": total("venta_riesgo_quiebre_usd"),
         "inventario_riesgo_vencimiento_usd": total("inventario_riesgo_vencimiento_usd"),
         "inventario_vencido_usd": total("inventario_vencido_usd"),
-        "salud_catalogo": health, "matriz_abc": matrix,
+        "salud_catalogo": count_sku_states(rows), "matriz_abc": matrix,
         "skus_sin_clase_margen": sum(row["clase_margen"] is None for row in rows),
         "cobertura_calculo": {
             "skus_sin_estimacion_exceso": sum(row["capital_sobreinventario_usd"] is None for row in rows),

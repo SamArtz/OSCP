@@ -14,13 +14,14 @@ import { Dialog } from "./dialog";
 import { OrderTable } from "./order-table";
 import { SourceUpload } from "./source-upload";
 import { WorkspaceShell } from "./workspace-shell";
+import { useDataset } from "./dataset-provider";
 
 const PAGE_SIZE = 10;
 const emptyFilters = { supplier: "", category: "", brand: "", search: "", view: "todos" as View };
 
 export function ReplenishmentDesk() {
   const [data, setData] = useState<OCSResponse | null>(null);
-  const [sources, setSources] = useState<Sources>({});
+  const { sources, setSources, windowDays, setWindowDays, sourceLabel } = useDataset();
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState("");
@@ -29,7 +30,6 @@ export function ReplenishmentDesk() {
   const [edits, setEdits] = useState<Edits>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filters, setFilters] = useState(emptyFilters);
-  const [windowDays, setWindowDays] = useState(60);
   const [page, setPage] = useState(1);
   const [sort, setSort] = useState<"priority" | "sku-asc" | "sku-desc">("priority");
   const [modal, setModal] = useState<"sources" | "warnings" | "help" | null>(null);
@@ -55,7 +55,7 @@ export function ReplenishmentDesk() {
     }
   }, []);
 
-  useEffect(() => { void calculate({}, 60); return () => controller.current?.abort(); }, [calculate]);
+  useEffect(() => { void calculate(sources, windowDays); return () => controller.current?.abort(); }, [calculate, sources, windowDays]);
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if (event.key === "/" && !(event.target instanceof HTMLElement && event.target.closest("input,textarea,select,[contenteditable]"))) {
@@ -67,16 +67,16 @@ export function ReplenishmentDesk() {
   }, []);
 
   const adjusted = rows.filter(row => isAdjusted(row, edits)).length;
-  const critical = rows.filter(row => isCritical(row, warnings));
+  const critical = rows.filter(row => isCritical(row));
   const order = selectedOrder(rows, selected, edits);
   const originalCost = rows.reduce((total, row) => total + row.costo_total_usd, 0);
   const suppliers = [...new Set(rows.map(row => row.proveedor_id))].sort();
   const categories = [...new Set(rows.map(row => row.categoria))].sort();
   const brands = [...new Set(rows.filter(row => !filters.category || row.categoria === filters.category).map(row => row.marca))].sort();
-  const filtered = filterRows(rows, filters, edits, warnings).sort((a, b) => {
+  const filtered = filterRows(rows, filters, edits).sort((a, b) => {
     if (sort === "sku-asc") return a.sku_id.localeCompare(b.sku_id);
     if (sort === "sku-desc") return b.sku_id.localeCompare(a.sku_id);
-    return Number(isCritical(b, warnings)) - Number(isCritical(a, warnings)) || b.cantidad_sugerida_cajas - a.cantidad_sugerida_cajas || a.sku_id.localeCompare(b.sku_id);
+    return Number(isCritical(b)) - Number(isCritical(a)) || b.cantidad_sugerida_cajas - a.cantidad_sugerida_cajas || a.sku_id.localeCompare(b.sku_id);
   });
   const currentPage = Math.min(page, Math.max(1, Math.ceil(filtered.length / PAGE_SIZE)));
   const visible = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
@@ -105,7 +105,8 @@ export function ReplenishmentDesk() {
   }
   function recalculate(files = sources, days = windowDays) {
     if (adjusted && !window.confirm("Recalcular descartará las cantidades ajustadas. ¿Deseas continuar?")) return;
-    setSources(files); setWindowDays(days); setModal(null); void calculate(files, days);
+    setSources(files); setWindowDays(days); setModal(null);
+    if (files === sources && days === windowDays) void calculate(files, days);
   }
   function showWarnings(sku: string | null = null) { setWarningSku(sku); setModal("warnings"); }
   async function exportOrder() {
@@ -124,7 +125,7 @@ export function ReplenishmentDesk() {
       <main>
         <div className="page-heading"><div><div className="page-eyebrow"><span className="eyebrow-line" /> REABASTECIMIENTO INTELIGENTE</div><h1>Mesa de trabajo <span>OCS</span></h1><p>De la demanda a la compra. Revisa, ajusta y confirma tu próximo pedido.</p></div><div className="heading-actions"><button className="button-secondary" disabled={disabled} onClick={() => setModal("sources")}><Upload size={16} /> Cargar archivos</button><button className="button-primary" onClick={exportOrder} disabled={!canExport}>{exporting ? <Loader2 size={16} className="animate-spin" /> : <ArrowDownToLine size={16} />} Descargar Orden de Compra (.xlsx)</button></div></div>
 
-        <div className="context-row"><div className="context-item"><CalendarDays size={14} /><span>Corte de inventario</span><strong>{data ? dateLabel(data.fecha_corte) : "Pendiente"}</strong></div><span className="context-separator" /><div className="context-item"><span className={`connection-dot ${data && !error ? "online" : ""}`} />{loading ? "Calculando sugerencias…" : error ? "Requiere atención" : data ? "Datos validados" : "Sin datos"}</div><div className="model-label"><span className="model-dot" /> Baseline + estacionalidad semanal</div></div>
+        <div className="context-row"><div className="context-item"><CalendarDays size={14} /><span>Corte de inventario</span><strong>{data ? dateLabel(data.fecha_corte) : "Pendiente"}</strong></div><span className="context-separator" /><div className="context-item"><span className={`connection-dot ${data && !error ? "online" : ""}`} />{loading ? "Calculando sugerencias…" : error ? "Requiere atención" : data ? "Datos validados" : "Sin datos"}</div><span className="context-item">{sourceLabel}</span><div className="model-label"><span className="model-dot" /> Baseline + estacionalidad semanal</div></div>
 
         {error && <div className="error-banner" role="alert"><TriangleAlert size={20} /><div><strong>No pudimos actualizar las sugerencias</strong><p>{error}</p>{data && <p>La tabla conserva el cálculo anterior. La exportación está deshabilitada hasta actualizarlo.</p>}</div><button className="button-secondary" onClick={() => recalculate()}>Reintentar</button></div>}
         {exportError && <div className="error-banner" role="alert"><TriangleAlert size={20} /><div><strong>No se pudo descargar la orden</strong><p>{exportError}</p></div><button className="icon-button" aria-label="Cerrar error de exportación" onClick={() => setExportError("")}><X size={18} /></button></div>}
@@ -134,10 +135,10 @@ export function ReplenishmentDesk() {
           <Metric label="COMPRA CONFIRMADA" value={data ? usd(order.total) : "—"} icon={<span className="money-symbol">$</span>} foot={data ? `Sugerencia inicial: ${usd(originalCost)}` : "Pendiente de cálculo"} accent />
           <Metric label="SKU A REABASTECER" value={data ? number(order.lines.length) : "—"} icon={<Package size={19} />} foot={data ? `De ${rows.length} productos analizados` : "Catálogo de productos"} />
           <Metric label="CAJAS CONFIRMADAS" value={data ? number(order.boxes) : "—"} icon={<Boxes size={19} />} foot={data ? `${number(order.units)} unidades físicas` : "Respeta múltiplos de caja"} />
-          <Metric label="RIESGO DE QUIEBRE" value={data ? number(critical.length) : "—"} icon={<TriangleAlert size={19} />} foot="Antes de la próxima recepción" danger={critical.length > 0} />
+          <Metric label="RIESGO DE QUIEBRE" value={data ? number(critical.length) : "—"} icon={<TriangleAlert size={19} />} foot="Actual o proyectado a 14 días" danger={critical.length > 0} />
         </section>
 
-        {!!data && <div className={`attention-strip ${critical.length > 0 ? "has-alerts" : ""}`}><div className="attention-icon">{critical.length > 0 ? <TriangleAlert size={18} /> : <ShieldCheck size={18} />}</div><p>{critical.length > 0 ? <><strong>{critical.length} SKU podrían agotarse antes de la recepción.</strong><span> Revisa las alertas y considera una compra urgente o transferencia.</span></> : <><strong>Revisa las restricciones antes de confirmar.</strong><span> Las cantidades sugeridas respetan el MOQ y los múltiplos de caja.</span></>}</p><button onClick={() => showWarnings()}>Revisar avisos <ArrowUpRight size={15} /></button></div>}
+        {!!data && <div className={`attention-strip ${critical.length > 0 ? "has-alerts" : ""}`}><div className="attention-icon">{critical.length > 0 ? <TriangleAlert size={18} /> : <ShieldCheck size={18} />}</div><p>{critical.length > 0 ? <><strong>{critical.length} SKU en quiebre o riesgo a 14 días.</strong><span> Mismo criterio que el tablero. Revisa también los avisos de urgencia durante el lead time.</span></> : <><strong>Revisa las restricciones antes de confirmar.</strong><span> Las cantidades sugeridas respetan el MOQ y los múltiplos de caja.</span></>}</p><button onClick={() => showWarnings()}>Revisar avisos <ArrowUpRight size={15} /></button></div>}
 
         <section className="workbench" aria-label="Mesa de trabajo OCS">
           <div className="workbench-heading"><div><h2>Sugerencias de compra <span className="count-badge">{rows.length}</span></h2><p>La sugerencia es tu punto de partida. Tú confirmas la cantidad final.</p></div><div className="workbench-controls"><label className="window-select"><CalendarDays size={14} /><select aria-label="Ventana histórica" value={windowDays} disabled={disabled} onChange={event => recalculate(sources, Number(event.target.value))}><option value={60}>Últimos 60 días</option><option value={30}>Últimos 30 días</option></select><ChevronDown size={12} /></label><button className="icon-button refresh-button" title="Recalcular con los archivos actuales" aria-label="Recalcular sugerencias" disabled={disabled} onClick={() => recalculate()}><RefreshCw size={16} className={loading ? "animate-spin" : ""} /></button></div></div>

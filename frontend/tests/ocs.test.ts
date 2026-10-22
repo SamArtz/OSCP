@@ -6,7 +6,7 @@ import type { OCSRow } from "../lib/types.ts";
 const row: OCSRow = {
   proveedor_id: "PROV-1", sku_id: "SKU-1", sku_proveedor: "P-1", nombre_producto: "Néctar de durazno",
   categoria: "Bebidas", marca: "Marca A", clasificacion_abc: "A", costo_unitario_usd: 2,
-  estado_sku: "ACTIVO", estado_sugerencia: "CALCULADO", stock_disponible: 0, stock_utilizable: 0,
+  estado_sku: "ACTIVO", estado_sugerencia: "CALCULADO", estado_salud: "quiebre", cobertura_dias: 0, riesgo_quiebre_14_dias: true, auditoria_demanda: null, stock_disponible: 0, stock_utilizable: 0,
   stock_en_transito: 12, stock_en_transito_a_tiempo: 0, lead_time_dias: 5,
   pronostico_demanda_lead_time: 30, stock_seguridad: 5, punto_reorden: 35, bajo_punto_reorden: true,
   demanda_no_cubierta_antes_recepcion: 30, unidades_por_caja: 12, moq_cajas: 2,
@@ -35,7 +35,7 @@ test("un ajuste cambia unidades y total, preservando sugerencia", () => {
 test("selección global conserva líneas ocultas por filtros", () => {
   const second = { ...row, proveedor_id: "PROV-2", sku_id: "SKU-2" };
   const rows = [row, second];
-  const filtered = filterRows(rows, { supplier: "PROV-1", category: "", brand: "", search: "", view: "todos" }, {}, []);
+  const filtered = filterRows(rows, { supplier: "PROV-1", category: "", brand: "", search: "", view: "todos" }, {});
   assert.equal(filtered.length, 1);
   const order = selectedOrder(rows, new Set(rows.map(rowKey)), {});
   assert.equal(order.lines.length, 2);
@@ -48,8 +48,8 @@ test("no descarta silenciosamente cantidades inválidas seleccionadas", () => {
 });
 test("filtra categoría, marca y búsqueda sin acentos", () => {
   const filters = { supplier: "", category: "Bebidas", brand: "Marca A", search: "nectar", view: "todos" };
-  assert.equal(filterRows([row], filters, {}, []).length, 1);
-  assert.equal(filterRows([row], { ...filters, brand: "Otra" }, {}, []).length, 0);
+  assert.equal(filterRows([row], filters, {}).length, 1);
+  assert.equal(filterRows([row], { ...filters, brand: "Otra" }, {}).length, 0);
 });
 test("productos descontinuados no son comprables", () => {
   assert.ok(quantityError({ ...row, estado_sku: "DESCONTINUADO" }, "3"));

@@ -1,6 +1,7 @@
 """Navegador real para el tablero; ambos servidores y Excel locales requeridos."""
 
 import os
+import re
 from pathlib import Path
 import shutil
 import tempfile
@@ -36,6 +37,9 @@ def run():
             assert all(value == "Quiebre / riesgo" for value in page.locator("tbody .health-state-pill").all_text_contents())
             show_all = page.locator(".priorities-panel .executive-panel-heading").get_by_role("button", name="Ver catálogo completo", exact=True)
             show_all.click()
+            for text in page.locator("tbody tr td:nth-child(4)").all_text_contents():
+                if text.endswith(" d"):
+                    assert re.fullmatch(r"[\d,]+(?:\.\d)? d", text), text
             cell = next(cell for cell in data["matriz_abc"] if cell["cantidad"] > 0)
             page.get_by_role("button", name=f"Volumen {cell['volumen']}, margen {cell['margen']}: {cell['cantidad']} SKU", exact=True).click()
             expect(page.locator("tbody tr")).to_have_count(min(10, cell["cantidad"]))

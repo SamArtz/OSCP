@@ -1,3 +1,11 @@
+import type { HealthCounts, HealthState } from "./sku-state.ts";
+
+export interface DemandAudit {
+  fecha_desde: string; fecha_hasta: string; dias_observados: number;
+  suma_pesos: number; suma_demanda_por_peso: number; media_diaria_sin_redondear: number;
+  factores_lunes_a_domingo: number[]; formula_media: string; formula_pronostico: string;
+}
+
 export interface OCSRow {
   proveedor_id: string;
   sku_id: string;
@@ -9,6 +17,10 @@ export interface OCSRow {
   costo_unitario_usd: number;
   estado_sku: string;
   estado_sugerencia: string;
+  estado_salud: HealthState;
+  cobertura_dias: number | null;
+  riesgo_quiebre_14_dias: boolean | null;
+  auditoria_demanda: DemandAudit | null;
   stock_disponible: number | null;
   stock_utilizable: number | null;
   stock_en_transito: number | null;
@@ -36,6 +48,7 @@ export interface OCSResponse {
   parametros: ForecastParams;
   orden_sugerida: OCSRow[];
   advertencias: Warning[];
+  salud_catalogo: HealthCounts;
 }
 export type SourceName = "ventas_historicas" | "catalogo_sku" | "inventario_actual";
 export type Sources = Partial<Record<SourceName, File>>;

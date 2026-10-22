@@ -9,12 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from math import ceil, isfinite, sqrt
+from numbers import Integral
 from statistics import NormalDist
 
 import pandas as pd
 
-from integrity import EngineInputError, validate_sku_integrity
-from stock_policy import coverage_metrics, quantity, shortfall
+from integrity import EngineInputError, catalog_with_inventory, join_catalog, validate_sku_integrity, validate_sku_keys
+from stock_policy import RISK_DAYS, calcular_estado_sku, count_sku_states, quantity, shortfall
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,25 @@ class DemandProfile:
     sigma: float
     weekday_factors: tuple[float, ...]
     seasonal: bool
+
+    def audit(self) -> dict:
+        """Operandos sin redondeo de presentación para reproducir el pronóstico."""
+        weights = pd.Series(range(1, len(self.daily) + 1), index=self.daily.index, dtype=float)
+        return {
+            "version": "ponderado_semanal_v1",
+            "fecha_desde": self.daily.index.min().date().isoformat(),
+            "fecha_hasta": self.daily.index.max().date().isoformat(),
+            "dias_observados": len(self.daily),
+            "suma_pesos": int(weights.sum()),
+            "suma_demanda_por_peso": float((self.daily * weights).sum()),
+            "media_diaria_sin_redondear": self.mean,
+            "sigma_diaria_sin_redondear": self.sigma,
+            "factores_lunes_a_domingo": list(self.weekday_factors),
+            "estacionalidad_aplicada": self.seasonal,
+            "formula_media": "sum(w_t * d_t) / sum(w_t); w_t=1..n del día más antiguo al reciente",
+            "formula_pronostico": "sum(media_diaria * factor_dia_semana) desde el corte durante el horizonte",
+            "definicion_demanda": "FACTURA: vendidas + bonificadas; NC excluidas; días calendario sin movimiento=0; ventas >= corte excluidas",
+        }
 
     def forecast(self, cutoff: pd.Timestamp, days: int) -> list[float]:
         return [
@@ -178,6 +198,42 @@ def money(quantity: int, unit_cost: float) -> float:
     return float((Decimal(quantity) * Decimal(str(unit_cost))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def price_suggested_lines(rows: list[dict], catalog: pd.DataFrame) -> list[dict]:
+    """Valora una sola vez desde el catálogo original, después de calcular unidades.
+
+    Descarta cualquier precio/total previo de las filas intermedias. Solo cruza
+    las claves: convertir todas las filas a DataFrame alteraría sus None y tipos.
+    """
+    if not rows:
+        return []
+    keys = pd.DataFrame({"sku_id": [row["sku_id"] for row in rows]})
+    validate_sku_keys(keys, "orden_sugerida", unique=True)
+    matched = join_catalog(keys, catalog, ["costo_unitario_usd"])
+    costs = {item.sku_id: float(item.costo_unitario_usd) for item in matched.itertuples(index=False)}
+    priced = []
+    for row in rows:
+        units = row["cantidad_sugerida_unidades"]
+        unit_cost = costs[row["sku_id"]]
+        if isinstance(units, bool) or not isinstance(units, Integral) or units < 0:
+            raise EngineInputError("CANTIDAD_COMPRA_INVALIDA", "Las unidades sugeridas deben ser enteras no negativas.")
+        if not isfinite(unit_cost) or unit_cost < 0:
+            raise EngineInputError("COSTO_CATALOGO_INVALIDO", "El costo del catálogo debe ser finito y no negativo.")
+        priced.append({**row, "costo_unitario_usd": unit_cost, "costo_total_usd": money(int(units), unit_cost)})
+    return priced
+
+
+def evaluate_sku_state(lots: pd.DataFrame, profile: DemandProfile | None, cutoff: pd.Timestamp) -> tuple[dict, dict]:
+    """Mismos datos y horizonte de salud para los dos endpoints."""
+    forecast = profile.forecast(cutoff, RISK_DAYS) if profile else [0.0] * RISK_DAYS
+    fefo = simulate_fefo(lots, cutoff, forecast)
+    state = calcular_estado_sku(
+        fefo["usable_stock"] if not lots.empty else None,
+        profile.mean if profile else None,
+        fefo["uncovered_by_day"][RISK_DAYS - 1] if profile and not lots.empty else None,
+    )
+    return state, fefo
+
+
 def generate_suggested_order(
     sales: pd.DataFrame,
     catalog: pd.DataFrame,
@@ -216,7 +272,8 @@ def generate_suggested_order(
     invoices["demand"] = invoices.unidades_vendidas + invoices.unidades_bonificadas
     grouped = invoices.groupby(["sku_id", "day"]).demand.sum()
     z_score = NormalDist().inv_cdf(config.service_level)
-    for item in catalog.sort_values(["proveedor_id", "sku_id"]).itertuples(index=False):
+    master = catalog_with_inventory(catalog, inventory)
+    for item in master.sort_values(["proveedor_id", "sku_id"]).itertuples(index=False):
         sku = str(item.sku_id)
         lead = int(item.lead_time_dias)
         horizon = lead + config.review_days
@@ -234,7 +291,7 @@ def generate_suggested_order(
         has_transit = lots.stock_en_transito.gt(0)
         transit_lead = int(lots.loc[has_transit & eta.between(cutoff, cutoff + pd.Timedelta(days=lead)), "stock_en_transito"].sum())
         transit_eligible = int(lots.loc[has_transit & eta.between(cutoff, cutoff + pd.Timedelta(days=horizon)), "stock_en_transito"].sum())
-        transit_total = int(lots.stock_en_transito.sum())
+        transit_total = int(item.stock_en_transito) if not lots.empty else 0
         transit_overdue = int(lots.loc[has_transit & eta.lt(cutoff), "stock_en_transito"].sum())
         transit_late = transit_total - transit_eligible - transit_overdue
         losses_lead = fefo["losses_by_day"][lead]
@@ -253,8 +310,7 @@ def generate_suggested_order(
             status = "SIN_HISTORIAL"
         boxes = max(int(item.moq_cajas), ceil(Decimal(str(deficit)) / int(item.unidades_por_caja))) if deficit > 0 and status == "CALCULADO" else 0
         units = boxes * int(item.unidades_por_caja)
-        total_cost = money(units, item.costo_unitario_usd)
-        coverage = coverage_metrics(fefo["usable_stock"] if not lots.empty else None, profile.mean if profile else None)
+        health_state, _ = evaluate_sku_state(lots, profile, cutoff)
         if status != "CALCULADO":
             warn(warnings, sku, status, "No se genera compra automática para este SKU; revise estado, inventario o historial.")
         if profile is not None and len(profile.daily) < 28:
@@ -276,19 +332,21 @@ def generate_suggested_order(
         risk_before_arrival = uncovered_lead > 0 if profile and not lots.empty else None
         if risk_before_arrival:
             warn(warnings, sku, "RIESGO_QUIEBRE_ANTES_RECEPCION", "La compra normal no evita el faltante previo a su llegada: revise urgencia o transferencia.")
+        if health_state["estado_salud"] == "quiebre":
+            warn(warnings, sku, "RIESGO_QUIEBRE_14_DIAS", "Stock utilizable cero o faltante proyectado en 14 días; es el estado de salud común con el tablero.")
         if lead == 0 and config.review_days == 0:
             warn(warnings, sku, "HORIZONTE_CERO", "Con plazo y revisión cero el objetivo es cero; configure un horizonte para planificar cobertura.")
         if units > 0 and profile and units > profile.total(cutoff + pd.Timedelta(days=lead), int(item.vida_util_dias)):
             warn(warnings, sku, "MOQ_RIESGO_SOBRESTOCK", "La compra excede la demanda estimada en la vida útil nominal; confirme el vencimiento real del lote entrante.")
         rows.append({
+            **health_state,
             "proveedor_id": str(item.proveedor_id), "sku_id": sku,
             "nombre_producto": str(item.nombre_producto), "estado_sku": str(item.estado),
             "sku_proveedor": str(item.sku_proveedor),
             "categoria": str(item.categoria), "marca": str(item.marca),
             "clasificacion_abc": str(item.clasificacion_abc),
-            "costo_unitario_usd": float(item.costo_unitario_usd),
             "estado_sugerencia": status,
-            "stock_disponible": fefo["raw_stock"] if not lots.empty else None,
+            "stock_disponible": int(item.stock_disponible) if not lots.empty else None,
             "stock_utilizable": fefo["usable_stock"] if not lots.empty else None,
             "stock_vencido_excluido": fefo["expired_stock"],
             "posible_demanda_censurada": fefo["usable_stock"] == 0 if not lots.empty else None,
@@ -299,7 +357,7 @@ def generate_suggested_order(
             "stock_en_transito_fuera_horizonte": transit_late,
             "lead_time_dias": lead,
             "demanda_diaria_ponderada": round(profile.mean, 6) if profile else None,
-            "cobertura_dias": coverage["days"], "sobreinventario": coverage["overstock"],
+            "auditoria_demanda": profile.audit() if profile else None,
             "desviacion_diaria_residual": round(profile.sigma, 6) if profile else None,
             "dias_historial_utilizados": len(profile.daily) if profile else 0,
             "modelo": "ponderado_estacional_semanal" if profile and profile.seasonal else "ponderado" if profile else "sin_historial",
@@ -316,8 +374,9 @@ def generate_suggested_order(
             "riesgo_quiebre_antes_recepcion": risk_before_arrival,
             "unidades_por_caja": int(item.unidades_por_caja), "moq_cajas": int(item.moq_cajas),
             "cantidad_sugerida_cajas": boxes, "cantidad_sugerida_unidades": units,
-            "costo_total_usd": total_cost, "prioridad_fefo": fefo["lots"],
+            "prioridad_fefo": fefo["lots"],
         })
+    rows = price_suggested_lines(rows, catalog)
     suppliers = []
     for supplier in sorted({row["proveedor_id"] for row in rows}):
         selected = [row for row in rows if row["proveedor_id"] == supplier]
@@ -334,6 +393,9 @@ def generate_suggested_order(
             "z_score": round(z_score, 6), "peso_estacional": config.seasonal_weight,
             "dias_revision": config.review_days,
             "demanda": "FACTURA: unidades_vendidas + unidades_bonificadas; NC excluidas del pronóstico",
+            "dias_riesgo_quiebre": RISK_DAYS,
+            "formula_costo": "cantidad_sugerida_unidades * costo_unitario_usd; ROUND_HALF_UP a centavos",
         },
+        "salud_catalogo": count_sku_states(rows),
         "orden_sugerida": rows, "resumen_proveedores": suppliers, "advertencias": warnings,
     }
