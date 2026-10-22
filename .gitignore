@@ -5,3 +5,10 @@ __pycache__/
 .env
 # Los datos comerciales quedan locales; no se versionan.
 *.xlsx
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.env.local
+playwright-report/
+test-results/

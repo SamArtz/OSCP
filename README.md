@@ -272,3 +272,28 @@ Las pruebas del motor verifican valores numéricos conocidos de media, ROP, caja
 costo, fecha de tránsito y consumo FEFO, además de la integración y regresión ETL.
 
 Ver [INFORME_DATOS.md](INFORME_DATOS.md) para los resultados de los nueve adjuntos.
+
+## Paso 3: mesa de trabajo web
+
+La aplicación Next.js App Router + Tailwind está en [`frontend/`](frontend/README.md).
+Con FastAPI iniciado en el puerto 8000, abre otra terminal:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Usa Node.js 22.18+ y abre `http://127.0.0.1:3000/replenishment` en tu ordenador.
+Incluye filtros de proveedor/categoría/marca, ABC, alertas, cantidades editables,
+selección por líneas y descarga XLSX estándar. `FASTAPI_URL` en
+`frontend/.env.local` configura la conexión desde el servidor de Next.js.
+
+El OCS ahora incluye `categoria`, `marca`, `clasificacion_abc`, `sku_proveedor`,
+`costo_unitario_usd` y `huella_datos` sin quitar campos previos.
+El nuevo `POST /api/v1/replenishment/export` acepta multipart con `orden` (JSON)
+y los mismos uploads opcionales; valida la huella y vuelve a calcular los costos.
+El JSON lleva `fecha_corte`, `huella_datos`, los cuatro parámetros del modelo y
+`lineas` con `proveedor_id`, `sku_id` y `cantidad_cajas` confirmadas.
+Devuelve el archivo con hojas Orden_Compra, Auditoria y Parametros.
+No persiste ajustes, no emite compras ni cambia los Excel originales.

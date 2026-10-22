@@ -279,6 +279,10 @@ def generate_suggested_order(
         rows.append({
             "proveedor_id": str(item.proveedor_id), "sku_id": sku,
             "nombre_producto": str(item.nombre_producto), "estado_sku": str(item.estado),
+            "sku_proveedor": str(item.sku_proveedor),
+            "categoria": str(item.categoria), "marca": str(item.marca),
+            "clasificacion_abc": str(item.clasificacion_abc),
+            "costo_unitario_usd": float(item.costo_unitario_usd),
             "estado_sugerencia": status,
             "stock_disponible": fefo["raw_stock"] if not lots.empty else None,
             "stock_utilizable": fefo["usable_stock"] if not lots.empty else None,

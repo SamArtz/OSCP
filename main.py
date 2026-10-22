@@ -7,6 +7,7 @@ Los archivos originales se conservan; todas las transformaciones son en memoria.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
 import os
@@ -17,13 +18,16 @@ from zipfile import BadZipFile, ZipFile
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from engine import EngineInputError, ReplenishmentConfig, generate_suggested_order
+from exporter import PurchaseExport, workbook_bytes
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).resolve()
@@ -64,7 +68,7 @@ SCHEMAS = {
     },
 }
 
-app = FastAPI(title="Demanda y reabastecimiento B2B", version="0.2.0")
+app = FastAPI(title="Demanda y reabastecimiento B2B", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -338,8 +342,61 @@ def replenishment_contents(contents, summary, errors, config, status_code=200):
         return JSONResponse(status_code=422, content=result)
     result.update(suggestion)
     result["estado"] = "exito"
+    result["huella_datos"] = source_fingerprint(contents)
     result["advertencias"] = warnings + suggestion["advertencias"]
     return JSONResponse(content=result)
+
+
+def source_fingerprint(contents):
+    digest = hashlib.sha256()
+    for name in sorted(contents):
+        digest.update(name.encode("utf-8"))
+        digest.update(hashlib.sha256(contents[name]).digest())
+    return digest.hexdigest()
+
+
+def export_contents(contents, summary, errors, order, status_code=200):
+    def failure(code, message, status=422):
+        issue(errors, "orden_compra", code, message)
+        return JSONResponse(status_code=status, content={"estado": "error", "errores": errors})
+
+    if errors:
+        return JSONResponse(status_code=error_status(status_code, 422), content={"estado": "error", "errores": errors})
+    if source_fingerprint(contents) != order.huella_datos:
+        return failure("DATOS_CAMBIARON", "Los archivos cambiaron desde el cálculo. Recalcule la OCS antes de exportar.", 409)
+    tables, _, status_code = load_validated_tables(contents, summary, errors, status_code)
+    if errors:
+        return JSONResponse(status_code=error_status(status_code, 422), content={"estado": "error", "errores": errors})
+    try:
+        result = generate_suggested_order(*(tables[key] for key in SCHEMAS), config=order.parametros.engine_config())
+    except EngineInputError as exc:
+        return failure(exc.code, str(exc))
+    if result["fecha_corte"] != order.fecha_corte.isoformat():
+        return failure("CORTE_CAMBIO", "El corte no coincide con la OCS que está confirmando.", 409)
+    index = {(row["proveedor_id"], row["sku_id"]): row for row in result["orden_sugerida"]}
+    seen, selected = set(), []
+    for line in order.lineas:
+        key = (line.proveedor_id, line.sku_id)
+        if key in seen:
+            return failure("LINEA_DUPLICADA", f"La línea {line.sku_id} está repetida.")
+        seen.add(key)
+        row = index.get(key)
+        if row is None:
+            return failure("SKU_PROVEEDOR_INVALIDO", f"No existe la combinación proveedor/SKU de {line.sku_id}.")
+        if line.cantidad_cajas == 0:
+            continue
+        if row["estado_sugerencia"] != "CALCULADO":
+            return failure("SKU_NO_COMPRABLE", f"{line.sku_id} requiere revisión: {row['estado_sugerencia']}.")
+        if line.cantidad_cajas < row["moq_cajas"]:
+            return failure("MOQ_INSUFICIENTE", f"{line.sku_id} requiere al menos {row['moq_cajas']} cajas o cantidad cero.")
+        selected.append((row, line.cantidad_cajas))
+    if not selected:
+        return failure("ORDEN_VACIA", "Seleccione al menos una línea con cantidad positiva.")
+    return Response(
+        content=workbook_bytes(selected, order),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="OCS_{order.fecha_corte.isoformat()}.xlsx"', "Cache-Control": "no-store"},
+    )
 
 
 def read_local(name):
@@ -432,3 +489,24 @@ async def suggested_order(
         ventas_historicas, catalogo_sku, inventario_actual
     )
     return await run_in_threadpool(replenishment_contents, contents, summary, errors, config, status_code)
+
+
+@app.post("/api/v1/replenishment/export")
+async def export_purchase_order(
+    orden: str = Form(...),
+    ventas_historicas: UploadFile | None = File(default=None),
+    catalogo_sku: UploadFile | None = File(default=None),
+    inventario_actual: UploadFile | None = File(default=None),
+):
+    """Exporta selección confirmada; costos y sugerencias se recalculan en servidor."""
+    try:
+        order = PurchaseExport.model_validate_json(orden)
+    except ValidationError as exc:
+        for upload in [ventas_historicas, catalogo_sku, inventario_actual]:
+            if upload is not None:
+                await upload.close()
+        return JSONResponse(status_code=422, content={"estado": "error", "errores": [
+            {"codigo": "ORDEN_INVALIDA", "mensaje": item["msg"], "campo": list(item["loc"])} for item in exc.errors()
+        ]})
+    contents, summary, errors, status_code = await collect_sources(ventas_historicas, catalogo_sku, inventario_actual)
+    return await run_in_threadpool(export_contents, contents, summary, errors, order, status_code)
